@@ -1,0 +1,2 @@
+# 截图保存目录
+# 程序运行时按 s 键截图会保存到此目录,文件名格式 pose_YYYYMMDD_HHMMSS.png
