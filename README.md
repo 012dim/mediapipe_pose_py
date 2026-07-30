@@ -1,36 +1,30 @@
-# MediaPipe Pose 动作识别
+# MediaPipe Pose 动作识别 + Arduino 交互系统
 
-基于 Google MediaPipe Pose 的实时人体姿态与动作识别项目。从 USB 摄像头实时读取视频流,识别 33 个人体关键点,绘制骨骼并显示 FPS,同时识别 6 种常见动作。
+基于 Google MediaPipe Pose 的实时手部动作识别项目,并扩展为双 Arduino Uno 控制的气泵 + 灯箱交互系统。摄像头实时识别手部动作,驱动 8 状态有限状态机,通过串口指令控制气泵充放气与灯箱亮灭,实现"抽题 → 计时 → 惩罚充气 → 结束放气"的完整交互流程。
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10.14-green) ![OpenCV](https://img.shields.io/badge/OpenCV-4.8%2B-orange) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10.14-green) ![OpenCV](https://img.shields.io/badge/OpenCV-4.8%2B-orange) ![Arduino](https://img.shields.io/badge/Arduino-Uno-00979D) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ## 特性
 
-- **实时 33 关键点检测**:鼻、肩、肘、腕、髋、膝、踝、手指、脚趾全覆盖
-- **6 种动作识别**:左手举起、右手举起、双手举起、站立、坐下、跌倒
-- **平滑滤波**:deque 缓存最近 5 帧坐标取平均,减少关键点抖动
-- **FPS 实时显示**:带 30 帧平滑滤波,数字不跳
-- **多色骨骼**:躯干/四肢/手/脚用不同颜色区分
-- **键盘交互**:截图、切换骨骼、切换摄像头、重置状态
-- **可选串口**:动作事件通过串口发送给 Arduino
+- **实时 33 关键点检测**:MediaPipe Pose 全身关键点,平滑滤波减少抖动
+- **3 种手部动作识别**:左手举起 / 右手举起 / 双手举起(画面镜像,与用户直觉一致)
+- **8 状态有限状态机**:INIT → WAITING → EXTRACTING → COUNTING ⇄ INFLATING → INTERVAL → ENDING → DEFLATING → 循环
+- **双 Arduino 控制**:Uno-A 控制 3 气泵(6 路继电器),Uno-B 控制灯箱 3 灯泡(3 路继电器)
+- **智能计时**:只有动作正确时才推进计时,错误/无动作时暂停(不重置)
+- **安全机制**:人离开超时自动放气;充气达上限锁定后续充气,放气后恢复
+- **误检防护**:核心关键点可见度校验 + 高置信度阈值,挡掉椅子/衣架等误检
+- **可视化面板**:状态名 / 计时进度条 / 充气量 / 灯泡亮灭 / 充气锁定提示
 - **跨平台**:Windows 10/11 优先,兼容 macOS、Linux
-- **开箱即用**:`pip install` 后 `python main.py` 一键运行
-
-## 效果截图
-
-程序运行时按 `s` 键截图,自动保存到 `screenshots/` 目录,文件名格式 `pose_YYYYMMDD_HHMMSS.png`。
-
-截图位置:`mediapipe_pose_py/screenshots/`
 
 ## 系统要求
 
-- **操作系统**:Windows 10 / 11(优先),macOS,Linux 也可
+- **操作系统**:Windows 10 / 11(优先),macOS,Linux
 - **Python**:3.10、3.11 或 3.12
 - **摄像头**:USB 摄像头(默认设备 ID 0)
+- **硬件**(可选):2 块 Arduino Uno + 6 路继电器模块(气泵)+ 3 路继电器模块(灯箱)
 - **CPU**:2018 年后 i5 笔记本即可,CPU 推理 ≥ 25 FPS
-- **内存**:< 300MB
 
-## 快速开始(3 步)
+## 快速开始
 
 ```bash
 # 1. 创建虚拟环境
@@ -46,7 +40,7 @@ python main.py
 
 > macOS / Linux 激活虚拟环境:`source venv/bin/activate`
 
-启动后 5 秒内即可看到摄像头画面 + 骨骼。按 `q` 退出。
+启动后进入 INIT 充气阶段(5 秒),随后等待人物出现。按 `q` 退出。
 
 ## 按键说明
 
@@ -56,28 +50,103 @@ python main.py
 | `s` | 截图保存到 `screenshots/`,文件名 `pose_YYYYMMDD_HHMMSS.png` |
 | `f` | 切换骨骼显示(纯视频流 ↔ 带骨骼) |
 | `c` | 切换摄像头 ID(0 → 1 → 2 → 0) |
-| `r` | 重置动作识别状态(清除冷却与最近动作) |
-| `Ctrl + C` | 优雅退出,释放摄像头与所有窗口 |
+| `r` | 重置动作识别 + 状态机(回到 INIT) |
+| `Ctrl + C` | 优雅退出,释放摄像头、串口与所有窗口 |
 
-## 识别的动作列表
+## 识别的动作
 
-| 动作 | 触发条件 | 事件名 | 中文显示 |
+| 动作 | 触发条件 | 事件名 | 对应灯泡 |
 |------|---------|--------|---------|
-| 左手举起 | 左手腕 Y < 鼻子 Y − 0.05 | `LEFT_HAND_UP` | 左手举起 |
-| 右手举起 | 右手腕 Y < 鼻子 Y − 0.05 | `RIGHT_HAND_UP` | 右手举起 |
-| 双手举起 | 左右手腕同时满足上述条件 | `BOTH_HANDS_UP` | 双手举起 |
-| 站立 | 膝关节角度 > 160° | `STAND` | 站立 |
-| 坐下 | 膝关节角度 < 130° | `SIT` | 坐下 |
-| 跌倒 | (肩 Y − 髋 Y) / 肩宽 < 0.3 | `FALL_DETECTED` | 跌倒 |
+| 左手举起 | 左手腕 Y < 鼻子 Y − 0.05 | `LEFT_HAND_UP` | 灯1 |
+| 右手举起 | 右手腕 Y < 鼻子 Y − 0.05 | `RIGHT_HAND_UP` | 灯2 |
+| 双手举起 | 左右手腕同时满足上述条件 | `BOTH_HANDS_UP` | 灯3 |
+| 无动作 | 以上均不满足 | `HAND_NONE` | — |
 
-- 动作触发后,屏幕底部高亮显示动作名,持续 **2 秒**
-- 每个动作有 **1 秒冷却**,避免重复触发
-- 触发时终端打印:`[14:32:15] 动作:BOTH_HANDS_UP`
+> 注:画面水平翻转(镜像),MediaPipe 的 LEFT_WRIST/RIGHT_WRIST 已交换判定,识别结果与用户直觉一致。
 
-### 动作优先级
+## Arduino 交互系统
 
-同一帧中多个动作同时满足时,按优先级触发最高者:
-`跌倒 > 双手举起 > 单手举起 > 站立 / 坐下`
+### 硬件接线
+
+```
+┌─────────────┐   USB    ┌──────────────┐
+│  摄像头      │──────────│  电脑(Python) │
+└─────────────┘          └──────┬───────┘
+                                │ COM3 / COM4
+                   ┌────────────┴────────────┐
+                   ▼                         ▼
+          ┌─────────────────┐       ┌─────────────────┐
+          │  Uno-A (气泵)    │       │  Uno-B (灯箱)    │
+          │  COM3 @ 9600     │       │  COM4 @ 9600     │
+          │                  │       │                  │
+          │  D2 → RELAY1 泵1充│       │  D2 → RELAY1 灯1 │
+          │  D3 → RELAY2 泵1放│       │  D3 → RELAY2 灯2 │
+          │  D4 → RELAY3 泵2充│       │  D4 → RELAY3 灯3 │
+          │  D5 → RELAY4 泵2放│       └─────────────────┘
+          │  D6 → RELAY5 泵3充│
+          │  D7 → RELAY6 泵3放│
+          └─────────────────┘
+```
+
+### 8 状态机流程
+
+```
+INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
+    ↓                                        ↓
+    └─────────────────────────────── COUNTING(计时,判动作)
+                          ↑↓错误           ↓ 计时完
+                  INFLATING(充气)       INTERVAL(灭灯)
+                      ↑正确               ↓
+                      └─────← n<3 ──→ n=3 → ENDING(三灯闪3次)
+                                               ↓ 人离开≥n4秒
+                                          DEFLATING(放气b秒)
+                                               ↓
+                                             回 INIT
+```
+
+| 状态 | 说明 |
+|------|------|
+| INIT | 发 `INFLATE_ALL,a`,初始充气 a 秒,gass=0 |
+| WAITING | 等待可靠人持续在线 ≥ n1 秒,进入抽题 |
+| EXTRACTING | 随机抽取目标动作,点亮对应灯泡(瞬态) |
+| COUNTING | 只有动作正确才推进计时;错误→INFLATING;无动作也判错误 |
+| INFLATING | 每秒发 `INFLATE_M` 充气,gass+=1;动作正确回 COUNTING(计时从暂停处继续) |
+| INTERVAL | 灭灯,间隔 1 秒;n<3 回 EXTRACTING,n=3 进 ENDING |
+| ENDING | 三灯闪烁 3 次;人离开 ≥ n4 秒或超时 30 秒进 DEFLATING |
+| DEFLATING | 发 `DEFLATE_ALL,b`,放气 b 秒,gass=0,回 INIT |
+
+**安全机制**:EXTRACTING/COUNTING/INFLATING/INTERVAL/ENDING 中人消失 ≥ n4 秒 → 立即 `STOP_ALL → LIGHT_ALL_OFF → DEFLATE_ALL`。
+
+**充气锁定**:gass 达 `GAS_MAX`(15)后停止充气,锁定后续充气指令(窗口显示红色提示),状态机继续流转,直到 ENDING → DEFLATING 放气后自动解锁。
+
+### 串口协议
+
+**气泵 (Uno-A, COM3)**:
+
+| 指令 | 含义 |
+|------|------|
+| `INFLATE_ALL,a` | 全部气泵充气 a 秒 |
+| `DEFLATE_ALL,b` | 全部气泵放气 b 秒 |
+| `INFLATE_M` | 主气泵点充一次(时长由 Arduino 端常量设定) |
+| `STOP_ALL` | 断开全部继电器 |
+
+**灯箱 (Uno-B, COM4)**:
+
+| 指令 | 含义 |
+|------|------|
+| `LIGHT_ON,id` | 点亮灯 id(1/2/3) |
+| `LIGHT_OFF,id` | 熄灭灯 id |
+| `LIGHT_ALL_OFF` | 全部熄灭 |
+| `LIGHT_FLASH,3` | 三灯闪烁 3 次 |
+
+### Arduino 参考代码
+
+完整的 Arduino 代码(含详细注释)见 [arduino_commands/](arduino_commands/) 目录:
+
+- [pump_uno_commands.txt](arduino_commands/pump_uno_commands.txt) — 气泵 Uno-A 代码,顶部可调 `INFLATE_M_MS_PER_PUMP`(每个气泵吸气时长)和 `INFLATE_M_PUMP_INDEX`(主气泵选择)
+- [lightbox_uno_commands.txt](arduino_commands/lightbox_uno_commands.txt) — 灯箱 Uno-B 代码,顶部可调引脚、触发电平、闪烁时长
+
+将代码复制到 Arduino IDE,修改顶部【用户可调参数区】后分别上传至两块 Uno。
 
 ## 33 个关键点编号对照表
 
@@ -92,138 +161,85 @@ MediaPipe Pose 输出 33 个关键点,坐标归一化到 [0, 1]:
     |             |
    13 左肘       14 右肘
     |             |
-   15 左腕  17-22 左手细节
-   16 右腕  17-22 右手细节
+   15 左腕       16 右腕
          \  /
    23 左髋 ─── 24 右髋
     |             |
    25 左膝       26 右膝
     |             |
    27 左踝       28 右踝
-    |             |
-   29 左跟  31 左脚趾
-   30 右跟  32 右脚趾
 ```
-
-| 编号 | 名称 | 编号 | 名称 |
-|------|------|------|------|
-| 0 | nose 鼻子 | 17 | left_pinky 左小指 |
-| 1 | left_eye_inner 左眼内 | 18 | right_pinky 右小指 |
-| 2 | left_eye 左眼 | 19 | left_index 左食指 |
-| 3 | left_eye_outer 左眼外 | 20 | right_index 右食指 |
-| 4 | right_eye_inner 右眼内 | 21 | left_thumb 左拇指 |
-| 5 | right_eye 右眼 | 22 | right_thumb 右拇指 |
-| 6 | right_eye_outer 右眼外 | 23 | left_hip 左髋 |
-| 7 | left_ear 左耳 | 24 | right_hip 右髋 |
-| 8 | right_ear 右耳 | 25 | left_knee 左膝 |
-| 9 | mouth_left 左嘴角 | 26 | right_knee 右膝 |
-| 10 | mouth_right 右嘴角 | 27 | left_ankle 左踝 |
-| 11 | left_shoulder 左肩 | 28 | right_ankle 右踝 |
-| 12 | right_shoulder 右肩 | 29 | left_heel 左跟 |
-| 13 | left_elbow 左肘 | 30 | right_heel 右跟 |
-| 14 | right_elbow 右肘 | 31 | left_foot_index 左脚趾 |
-| 15 | left_wrist 左腕 | 32 | right_foot_index 右脚趾 |
-| 16 | right_wrist 右腕 |  |  |
 
 详细编号表见 [docs/KEYPOINTS.md](docs/KEYPOINTS.md)。
 
 ## 配置说明
 
-所有可调参数集中在 [config.py](config.py),无需改动业务代码:
+所有可调参数集中在 [config.py](config.py):
+
+### 摄像头 / MediaPipe
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `CAMERA_ID` | `0` | 默认摄像头 ID |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640` / `480` | 采集分辨率 |
-| `CAMERA_FPS` | `30` | 目标帧率 |
-| `AVAILABLE_CAMERA_IDS` | `[0, 1, 2]` | 按 c 可循环切换的 ID |
 | `MODEL_COMPLEXITY` | `1` | 0 轻量 / 1 中等 / 2 最准 |
 | `SMOOTH_BUFFER_SIZE` | `5` | 关键点平滑缓冲帧数 |
+| `MIN_DETECTION_CONFIDENCE` | `0.7` | 检测置信度(提高以减少误检) |
+| `MIN_TRACKING_CONFIDENCE` | `0.6` | 跟踪置信度 |
 | `HAND_UP_THRESHOLD` | `0.05` | 举手判定阈值(归一化) |
-| `KNEE_ANGLE_STAND` | `160.0` | 站立膝关节角度阈值 |
-| `KNEE_ANGLE_SIT` | `130.0` | 坐下膝关节角度阈值 |
-| `FALL_RATIO_THRESHOLD` | `0.3` | 跌倒比率阈值 |
-| `ACTION_COOLDOWN` | `1.0` | 动作冷却时间(秒) |
-| `ACTION_DISPLAY_DURATION` | `2.0` | 动作显示时长(秒) |
-| `SERIAL_ENABLED` | `False` | 是否启用串口 |
-| `SERIAL_BAUDRATE` | `9600` | 串口波特率 |
 
-### 切换摄像头
+### Arduino 交互流程
 
-修改 `config.py` 中的 `CAMERA_ID`,或运行时按 `c` 键循环切换。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `INFLATE_TIME_A` | `5.0` | INIT 充气时长 a(秒) |
+| `DEFLATE_TIME_B` | `5.0` | DEFLATING 放气时长 b(秒) |
+| `PERSON_CONFIRM_N1` | `3.0` | WAITING 确认人在线时长 n1(秒) |
+| `COUNT_MIN_N2` | `5.0` | COUNTING 最短计时 n2(秒) |
+| `COUNT_MAX_N3` | `10.0` | COUNTING 最长计时 n3(秒) |
+| `ABSENCE_TIMEOUT_N4` | `3.0` | 人离开超时 n4(秒,触发安全放气) |
+| `ENDING_TIMEOUT` | `30.0` | ENDING 最长停留(秒,兜底防死锁) |
+| `LOOP_INTERVAL` | `1.0` | INTERVAL 间隔(秒) |
+| `LOOP_COUNT_MAX` | `3` | 一轮最多抽题次数 |
+| `GAS_MAX` | `15` | 充气次数上限,达到后锁定充气 |
 
-### 启用串口
+### 双 Arduino 串口
 
-把 `config.py` 中 `SERIAL_ENABLED = True`,并根据系统修改默认端口:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ARDUINO_BAUDRATE` | `9600` | Arduino 串口波特率 |
+| `PUMP_SERIAL_PORT` | `"COM3"` | Uno-A 气泵串口 |
+| `LIGHT_SERIAL_PORT` | `"COM4"` | Uno-B 灯箱串口 |
 
-```python
-# Windows
-DEFAULT_SERIAL_PORT_WIN = "COM3"
-# Linux
-DEFAULT_SERIAL_PORT_LINUX = "/dev/ttyUSB0"
-# macOS
-DEFAULT_SERIAL_PORT_MAC = "/dev/tty.usbserial*"
+> 串口发送设有 `write_timeout=0.5` 秒,对端不响应时不会卡死主循环。
+
+## 项目结构
+
 ```
-
-## Arduino 联动示例
-
-### 接线图
-
-```
-Arduino Uno           USB 摄像头
-┌─────────────┐       ┌──────────┐
-│             │       │          │
-│  RX (0) <───┼───────┼ USB      │
-│  TX (1) ────┼──┐    │ (本机)   │
-│             │  │    │          │
-│  GND ───────┼──┼────┼ GND      │
-│             │  │    └──────────┘
-│  LED 13 ────┘  │
-│                │
-│  USB-TTL 串口模块
-└─────────────┘
-```
-
-> 注意:USB 摄像头接电脑,Arduino 通过 USB 或 USB-TTL 模块接到电脑串口。Arduino 的 RX 接 USB-TTL 模块的 TX,反之亦然。
-
-### Arduino 接收端代码
-
-```cpp
-// Arduino 接收端:解析 POSE,动作名 串口数据
-String inputBuffer = "";
-
-void setup() {
-  Serial.begin(9600);
-  pinMode(13, OUTPUT);
-}
-
-void loop() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == '\n') {
-      handleLine(inputBuffer);
-      inputBuffer = "";
-    } else {
-      inputBuffer += c;
-    }
-  }
-}
-
-void handleLine(String line) {
-  // 协议:POSE,ACTION_NAME
-  if (!line.startsWith("POSE,")) return;
-  String action = line.substring(5);
-  if (action == "BOTH_HANDS_UP") {
-    digitalWrite(13, HIGH);
-    delay(500);
-    digitalWrite(13, LOW);
-  } else if (action == "FALL_DETECTED") {
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(13, HIGH); delay(100);
-      digitalWrite(13, LOW);  delay(100);
-    }
-  }
-}
+mediapipe_pose_py/
+├── main.py                     # 程序入口,主循环
+├── config.py                   # 配置文件(阈值、串口、状态机参数)
+├── requirements.txt            # Python 依赖列表
+├── conftest.py                 # pytest 配置
+├── README.md                   # 本文档
+├── modules/
+│   ├── __init__.py
+│   ├── camera.py               # 摄像头封装
+│   ├── pose_detector.py        # MediaPipe 姿态识别封装
+│   ├── visualizer.py           # 骨骼绘制 + 状态机面板 + 灯泡显示
+│   ├── action_recognizer.py    # 手部动作识别 + check_match 匹配
+│   ├── angle_calculator.py     # 关节角度计算工具
+│   ├── state_machine.py        # 8 状态有限状态机(核心)
+│   └── serial_sender.py        # 双串口 PumpSender + LightSender
+├── arduino_commands/           # Arduino 参考代码(不被 Python 执行)
+│   ├── pump_uno_commands.txt   # Uno-A 气泵代码(含详细注释)
+│   └── lightbox_uno_commands.txt # Uno-B 灯箱代码(含详细注释)
+├── models/                     # 占位(MediaPipe 用内置模型)
+├── screenshots/                # 截图保存目录
+└── docs/
+    ├── ARCHITECTURE.md         # 架构说明
+    ├── KEYPOINTS.md            # 33 关键点编号对照表
+    └── TROUBLESHOOTING.md      # 常见问题排查
 ```
 
 ## FAQ(常见问题)
@@ -232,61 +248,28 @@ void handleLine(String line) {
 A:未安装依赖。先激活虚拟环境,再执行 `pip install -r requirements.txt`。如安装慢,加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 
 **Q2:启动后报 `无法打开摄像头 0`?**
-A:① 摄像头被其他软件(Zoom、微信)占用,关闭后重试;② 设备 ID 不是 0,改 `config.py` 的 `CAMERA_ID` 或按 `c` 切换;③ 检查 USB 连接。
+A:① 摄像头被其他软件占用,关闭后重试;② 设备 ID 不是 0,改 `config.py` 的 `CAMERA_ID` 或按 `c` 切换;③ 检查 USB 连接。
 
-**Q3:FPS 低于 25?**
-A:① 降低 `MODEL_COMPLEXITY` 为 0(轻量);② 关闭其他占用 CPU 的程序;③ 降低分辨率到 480×360;④ 确认未启用 `model_complexity=2`。
+**Q3:等人阶段进度条不动?**
+A:MediaPipe 可能未检测到"可靠人"。确保上半身(鼻子+双肩)完整入镜且光照充足。半身坐姿也能识别,不强制要求髋部入镜。
 
-**Q4:举手没反应?**
-A:① 站到摄像头前,确保上半身完整入镜;② 手腕要明显高于鼻子(超过 5% 画面高度);③ 检查 `MIN_DETECTION_CONFIDENCE` 是否过低;④ 按 `r` 重置冷却再试。
+**Q4:进入抽题后程序卡死/窗口未响应?**
+A:串口 `write` 阻塞。已通过 `write_timeout=0.5` + 去掉 `flush()` 修复。若仍卡死,检查 COM3/COM4 是否被其他程序占用,或暂时不接 Arduino(状态机会继续流转,串口发送静默失败)。
 
-**Q5:骨骼闪烁严重?**
+**Q5:左右手识别反了?**
+A:画面已做水平翻转(镜像),代码中 LEFT_WRIST/RIGHT_WRIST 已交换判定。若仍反,检查是否修改过 `action_recognizer.py` 的 `_detect_hand_action`。
+
+**Q6:充气达上限后不充气了?**
+A:这是设计行为。gass 达 `GAS_MAX`(15)后锁定充气,窗口显示红色"充气已锁定!"提示。状态机继续流转,3 轮结束 → ENDING → DEFLATING 放气后自动解锁。
+
+**Q7:串口 COM3 打不开(OSError 121)?**
+A:Windows 错误 121 通常是端口被占用或 CH340 驱动异常。① 拔插 USB 重新枚举;② 关闭其他占用 COM3 的程序;③ 重装 CH340 驱动。代码侧已容错,不会因此崩溃。
+
+**Q8:举手没反应?**
+A:① 确保上半身完整入镜;② 手腕要明显高于鼻子(超过 5% 画面高度);③ 站到画面中央;④ 按 `r` 重置状态机。
+
+**Q9:骨骼闪烁严重?**
 A:① 增大 `SMOOTH_BUFFER_SIZE`(如改为 8);② 确认 `SMOOTH_LANDMARKS = True`;③ 改善光照条件,避免逆光。
-
-**Q6:跌倒误报?**
-A:① 调高 `FALL_RATIO_THRESHOLD`(如 0.4);② 确保肩部水平(头不歪);③ 站直时肩髋高度差应明显大于肩宽的 30%。
-
-**Q7:串口打不开?**
-A:① 确认 Arduino 已连接且驱动安装;② 检查端口名(COM3 / /dev/ttyUSB0);③ 关闭串口监视器等其他占用程序;④ 程序不会因串口失败崩溃,会继续运行。
-
-**Q8:`cv2.imshow` 窗口无响应?**
-A:① 确认 OpenCV 安装的是 `opencv-python` 而非 `opencv-python-headless`;② 不要在 SSH 远程无图形界面运行;③ Linux 需安装 GTK 系统库。
-
-**Q9:macOS 上摄像头权限被拒?**
-A:在 `系统设置 → 隐私与安全 → 摄像头` 中允许 Terminal / Python 访问摄像头。
-
-**Q10:按 `c` 切换摄像头后画面黑屏?**
-A:目标 ID 没有摄像头,程序会自动切回原摄像头。检查 `AVAILABLE_CAMERA_IDS` 配置。
-
-## 项目结构
-
-```
-mediapipe_pose_py/
-├── main.py                     # 程序入口,主循环
-├── config.py                   # 配置文件(阈值、端口、开关)
-├── requirements.txt            # Python 依赖列表
-├── conftest.py                 # pytest 配置(sys.path)
-├── .gitignore                  # Git 忽略文件
-├── README.md                   # 本文档
-├── modules/
-│   ├── __init__.py
-│   ├── camera.py               # 摄像头封装
-│   ├── pose_detector.py        # MediaPipe 姿态识别封装
-│   ├── visualizer.py           # 骨骼绘制 + FPS + 文字
-│   ├── action_recognizer.py    # 动作识别(6 种 + 冷却)
-│   ├── angle_calculator.py     # 关节角度计算工具
-│   └── serial_sender.py        # 串口发送(异步,容错)
-├── models/                     # 占位(MediaPipe 用内置模型)
-├── screenshots/                # 截图保存目录
-├── tests/                      # 单元测试(pytest)
-│   ├── test_angle_calculator.py
-│   ├── test_action_recognizer.py
-│   └── README.md
-└── docs/
-    ├── ARCHITECTURE.md         # 架构说明 + 类图
-    ├── KEYPOINTS.md            # 33 关键点编号对照表
-    └── TROUBLESHOOTING.md      # 常见问题排查
-```
 
 ## 运行测试
 
@@ -301,7 +284,7 @@ pytest tests/ -v
 | 推理帧率 | ≥ 25 FPS | 28-32 FPS(complexity=1) |
 | 内存占用 | < 300MB | ~180MB |
 | 启动到首帧 | < 5 秒 | ~3 秒 |
-| 关键点抖动 | 平滑 | deque-5 平均 |
+| 串口发送延迟 | < 1ms | < 1ms(正常)/ 0.5s 超时(异常) |
 
 ## License
 
