@@ -28,6 +28,7 @@ class SerialSender:
         port: str,
         baudrate: int = 9600,
         timeout: float = 1.0,
+        write_timeout: float = 0.5,
     ) -> None:
         """初始化串口参数。
 
@@ -35,10 +36,13 @@ class SerialSender:
             port: 串口端口名,如 'COM3' 或 '/dev/ttyUSB0'。
             baudrate: 波特率,默认 9600。
             timeout: 读超时秒数,默认 1.0。
+            write_timeout: 写超时秒数,默认 0.5。防止对端不消费数据时
+                write/flush 永久阻塞导致主循环卡死。
         """
         self.port: str = port
         self.baudrate: int = baudrate
         self.timeout: float = timeout
+        self.write_timeout: float = write_timeout
         self.serial_conn = None
         self._lock = threading.Lock()
         self._connected: bool = False
@@ -66,6 +70,7 @@ class SerialSender:
                 self.port,
                 self.baudrate,
                 timeout=self.timeout,
+                write_timeout=self.write_timeout,
             )
             # 等待串口稳定(部分 Arduino 板复位需要时间)
             time.sleep(0.5)
@@ -98,8 +103,11 @@ class SerialSender:
         data = (message + "\n").encode("utf-8")
         with self._lock:
             try:
+                # write 会把数据写入 OS 串口发送缓冲区,由硬件异步发送。
+                # 不调用 flush():Windows 上 FlushFileBuffers 会等待对端接收,
+                # 若对端不消费数据会永久阻塞,导致主循环卡死。
+                # write_timeout 保证 write 本身不会永久阻塞。
                 self.serial_conn.write(data)
-                self.serial_conn.flush()
                 return True
             except Exception as e:  # noqa: BLE001
                 logger.warning("串口发送失败: %s", e)
@@ -119,19 +127,18 @@ class SerialSender:
         """
         return self.send(f"POSE,{action_name}")
 
-    def send_dual_channel(self, body_action: str, hand_action: str) -> bool:
-        """发送双通道状态(两行):POSE_BODY,动作名 / POSE_HAND,动作名。
+    def send_hand_action(self, hand_action: str) -> bool:
+        """发送手部动作状态。
+
+        协议格式: POSE_HAND,动作名\\n
 
         Args:
-            body_action: 身体通道动作名,如 STAND / SIT / FALL_DETECTED / BODY_NONE。
-            hand_action: 手部通道动作名,如 BOTH_HANDS_UP / HAND_NONE。
+            hand_action: 手部动作名,如 BOTH_HANDS_UP / HAND_NONE。
 
         Returns:
-            bool: 两行均发送成功返回 True。
+            bool: 发送成功返回 True。
         """
-        ok1 = self.send(f"POSE_BODY,{body_action}")
-        ok2 = self.send(f"POSE_HAND,{hand_action}")
-        return ok1 and ok2
+        return self.send(f"POSE_HAND,{hand_action}")
 
     def close(self) -> None:
         """关闭串口连接。"""
@@ -150,3 +157,112 @@ class SerialSender:
     def is_connected(self) -> bool:
         """返回串口是否已连接。"""
         return self._connected
+
+
+# ============ 气泵串口(Uno-A) ============
+class PumpSender(SerialSender):
+    """气泵控制串口(Uno-A,3 气泵 / 6 路继电器)。
+
+    协议(每行一条,以 \\n 结尾):
+        INFLATE_ALL,a       全部气泵充气 a 秒
+        DEFLATE_ALL,b       全部气泵放气 b 秒
+        INFLATE_M           主气泵点充一次(用于 INFLATING 阶段每秒一次)
+        STOP_ALL            立即停止所有气泵
+    """
+
+    def send_inflate_all(self, seconds: float) -> bool:
+        """全部气泵充气指定秒数。
+
+        Args:
+            seconds: 充气时长(秒)。
+
+        Returns:
+            bool: 发送成功返回 True。
+        """
+        return self.send(f"INFLATE_ALL,{seconds}")
+
+    def send_deflate_all(self, seconds: float) -> bool:
+        """全部气泵放气指定秒数。
+
+        Args:
+            seconds: 放气时长(秒)。
+
+        Returns:
+            bool: 发送成功返回 True。
+        """
+        return self.send(f"DEFLATE_ALL,{seconds}")
+
+    def send_inflate_m(self) -> bool:
+        """主气泵点充一次(INFLATING 阶段每秒一次)。"""
+        return self.send("INFLATE_M")
+
+    def send_stop_all(self) -> bool:
+        """立即停止所有气泵。"""
+        return self.send("STOP_ALL")
+
+
+# ============ 灯箱串口(Uno-B) ============
+class LightSender(SerialSender):
+    """灯箱控制串口(Uno-B,3 路继电器控制 3 个灯泡)。
+
+    协议(每行一条,以 \\n 结尾):
+        LIGHT_ON,id         点亮指定编号灯泡(id ∈ {1,2,3})
+        LIGHT_OFF,id        熄灭指定编号灯泡
+        LIGHT_ALL_OFF       全部熄灭
+        LIGHT_FLASH,3       三灯同时闪烁 3 次(用于 ENDING)
+    """
+
+    # 动作 -> 灯泡编号映射
+    ACTION_TO_LIGHT_ID = {
+        "LEFT_HAND_UP": 1,
+        "RIGHT_HAND_UP": 2,
+        "BOTH_HANDS_UP": 3,
+    }
+
+    def send_light_on(self, light_id: int) -> bool:
+        """点亮指定编号灯泡。
+
+        Args:
+            light_id: 灯泡编号(1/2/3)。
+
+        Returns:
+            bool: 发送成功返回 True。
+        """
+        return self.send(f"LIGHT_ON,{light_id}")
+
+    def send_light_off(self, light_id: int) -> bool:
+        """熄灭指定编号灯泡。
+
+        Args:
+            light_id: 灯泡编号(1/2/3)。
+
+        Returns:
+            bool: 发送成功返回 True。
+        """
+        return self.send(f"LIGHT_OFF,{light_id}")
+
+    def send_all_off(self) -> bool:
+        """全部灯泡熄灭。"""
+        return self.send("LIGHT_ALL_OFF")
+
+    def send_flash(self, times: int = 3) -> bool:
+        """三灯同时闪烁若干次。
+
+        Args:
+            times: 闪烁次数(默认 3)。
+
+        Returns:
+            bool: 发送成功返回 True。
+        """
+        return self.send(f"LIGHT_FLASH,{times}")
+
+    def light_id_for_action(self, action_name: str) -> Optional[int]:
+        """根据手部动作名返回对应灯泡编号。
+
+        Args:
+            action_name: 手部动作名(LEFT_HAND_UP / RIGHT_HAND_UP / BOTH_HANDS_UP)。
+
+        Returns:
+            Optional[int]: 灯泡编号;无映射时返回 None。
+        """
+        return self.ACTION_TO_LIGHT_ID.get(action_name)

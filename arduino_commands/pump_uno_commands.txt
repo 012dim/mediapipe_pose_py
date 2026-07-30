@@ -1,0 +1,290 @@
+================================================================================
+气泵控制 Arduino Uno (Uno-A) 程序说明
+================================================================================
+
+【硬件接线】
+  Uno-A 控制 3 个气泵,通过 6 路继电器模块驱动:
+    - 每个气泵占用 2 路继电器:
+        * INFLATE 继电器:打开时气泵向气球充气
+        * DEFLATE 继电器:打开时气泵从气球抽气(放气)
+    - 继电器为低电平触发(常见 5V 继电器模块)。
+
+  Arduino Uno 引脚 -> 继电器映射:
+
+    引脚    继电器编号    气泵    功能
+    ----    ----------    ----    ----
+    D2      RELAY1        泵1     充气(INFLATE)
+    D3      RELAY2        泵1     放气(DEFLATE)
+    D4      RELAY3        泵2     充气(INFLATE)
+    D5      RELAY4        泵2     放气(DEFLATE)
+    D6      RELAY5        泵3     充气(INFLATE)
+    D7      RELAY6        泵3     放气(DEFLATE)
+
+  泵1 视为"主气泵"(INFLATE_M 指令使用)。
+
+【串口协议】
+  波特率 9600,每行一条指令,以 '\n' 结尾。指令不区分大小写(本程序按大写解析)。
+
+  指令格式                  含义
+  ----------------------    ------------------------------------------------
+  INFLATE_ALL,a             全部 3 个气泵的充气继电器闭合 a 秒后自动断开
+                            a 为浮点数,例如 "INFLATE_ALL,5.0"
+  DEFLATE_ALL,b             全部 3 个气泵的放气继电器闭合 b 秒后自动断开
+                            b 为浮点数,例如 "DEFLATE_ALL,5.0"
+  INFLATE_M                 主气泵(泵1)点充一次:闭合 X 秒后断开
+                            X 由下方 INFLATE_M_MS 常量决定(默认 1000ms = 1 秒)
+                            用于 INFLATING 状态每秒一次的惩罚充气
+  STOP_ALL                  立即断开所有继电器(停止全部充/放气动作)
+
+【安全说明】
+  - 同一气泵的充气与放气继电器不应同时闭合(会导致气路冲突)。
+    本程序在切换前会先断开对方继电器。
+  - STOP_ALL 优先级最高,收到后立即断开所有继电器。
+  - 充/放气时间到点后继电器自动断开,避免长时间通电。
+
+【与状态机的配合】
+  状态机(Python 端)在以下时机发送指令:
+    INIT         进入时发送 INFLATE_ALL,5        (初始充气 a 秒)
+    INFLATING    每秒发送一次 INFLATE_M           (惩罚充气,gass+=1)
+    INFLATING→COUNTING  发送 STOP_ALL             (用户做对动作,停止充气)
+    DEFLATING    进入时发送 DEFLATE_ALL,5         (放气 b 秒)
+    安全放气     发送 STOP_ALL → LIGHT_ALL_OFF(灯箱) → DEFLATE_ALL,5
+
+================================================================================
+【Arduino 参考代码(复制到 Arduino IDE 上传至 Uno-A)】
+================================================================================
+
+/*
+ * 气泵控制 Uno-A
+ * 接收串口指令控制 6 路继电器(3 气泵 × 2 方向)
+ *
+ * 串口协议(9600 baud,每行一条指令,以 '\n' 结尾):
+ *   INFLATE_ALL,a  全部气泵充气 a 秒
+ *   DEFLATE_ALL,b  全部气泵放气 b 秒
+ *   INFLATE_M      主气泵点充(时长见 INFLATE_M_MS)
+ *   STOP_ALL       断开全部继电器
+ */
+
+/* =====================================================================
+ * ★★★ 用户可调参数区(在 Arduino IDE 中修改此处即可)★★★
+ * ===================================================================== */
+
+// ---- 引脚定义 ----
+// INFLATE_PINS:3 个气泵的【充气】继电器引脚,分别对应泵1/泵2/泵3
+//   引脚号 2/4/6 对应硬件接线表中的 D2/D4/D6
+const int INFLATE_PINS[3]  = {2, 4, 6};
+
+// DEFLATE_PINS:3 个气泵的【放气】继电器引脚,分别对应泵1/泵2/泵3
+//   引脚号 3/5/7 对应硬件接线表中的 D3/D5/D7
+const int DEFLATE_PINS[3]  = {3, 5, 7};
+
+// ---- 继电器触发电平 ----
+// 常见 5V 继电器模块为【低电平触发】:
+//   true  -> 输出 LOW 时继电器闭合(导通)
+//   false -> 输出 HIGH 时继电器闭合(导通)
+// 若你的继电器模块是高电平触发,改为 false
+const bool RELAY_ACTIVE_LOW = true;
+
+/* ---------------------------------------------------------------------
+ * ★ INFLATE_M 指令:每个气泵吸气时长的设定位置 ★
+ * ---------------------------------------------------------------------
+ * 当 Python 端发送 INFLATE_M 指令时,Arduino 会闭合指定气泵的充气
+ * 继电器,保持一段时间后断开。这段"保持时间"就是每次点充的吸气量。
+ *
+ * 修改下面的数值即可调整每个气泵在 INFLATE_M 执行时的吸气时长:
+ *
+ *   INFLATE_M_MS_PER_PUMP[0] -> 泵1 的吸气时长(毫秒)
+ *   INFLATE_M_MS_PER_PUMP[1] -> 泵2 的吸气时长(毫秒)
+ *   INFLATE_M_MS_PER_PUMP[2] -> 泵3 的吸气时长(毫秒)
+ *
+ * 默认全部 1000ms(1 秒)。数值越大,每次充气量越多。
+ * 例如想让泵1 充 0.5 秒、泵2 充 1.2 秒、泵3 充 0.8 秒:
+ *   const unsigned long INFLATE_M_MS_PER_PUMP[3] = {500, 1200, 800};
+ * --------------------------------------------------------------------- */
+const unsigned long INFLATE_M_MS_PER_PUMP[3] = {1000, 1000, 1000};
+
+/* ---------------------------------------------------------------------
+ * ★ INFLATE_M 指令:使用哪个气泵作为"主气泵" ★
+ * ---------------------------------------------------------------------
+ * INFLATE_M 只会驱动【一个】气泵,由下方索引指定:
+ *   0 -> 泵1(INFLATE_PINS[0],引脚 D2)— 默认
+ *   1 -> 泵2(INFLATE_PINS[1],引脚 D4)
+ *   2 -> 泵3(INFLATE_PINS[2],引脚 D6)
+ * --------------------------------------------------------------------- */
+const int INFLATE_M_PUMP_INDEX = 0;  // 0=泵1, 1=泵2, 2=泵3
+
+/* =====================================================================
+ * 用户可调参数区结束
+ * ===================================================================== */
+
+
+// ---- 自动断开计时(运行时变量,无需修改)----
+// millis() 返回 Arduino 启动以来的毫秒数,用于非阻塞定时
+unsigned long inflateDeadline = 0;    // 全部充气应断开的时刻(millis)
+unsigned long deflateDeadline = 0;    // 全部放气应断开的时刻(millis)
+bool inflating = false;               // 当前是否正在执行全充气
+bool deflating = false;               // 当前是否正在执行全放气
+
+/**
+ * setRelay - 控制单个继电器闭合/断开
+ * @param pin  继电器连接的 Arduino 引脚号
+ * @param on   true=闭合, false=断开
+ *
+ * 根据 RELAY_ACTIVE_LOW 自动换算电平:
+ *   低电平触发模块:闭合时输出 LOW,断开时输出 HIGH
+ *   高电平触发模块:闭合时输出 HIGH,断开时输出 LOW
+ */
+void setRelay(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);   // 低触发:闭合=LOW
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);   // 高触发:闭合=HIGH
+  }
+}
+
+/**
+ * allOff - 断开全部 6 路继电器(3 充气 + 3 放气)
+ * 同时清除运行标志,供 STOP_ALL 指令和初始化调用
+ */
+void allOff() {
+  for (int i = 0; i < 3; i++) {
+    setRelay(INFLATE_PINS[i], false);   // 断开泵(i+1)充气
+    setRelay(DEFLATE_PINS[i], false);   // 断开泵(i+1)放气
+  }
+  inflating = false;   // 清除全充气标志
+  deflating = false;   // 清除全放气标志
+}
+
+/**
+ * startInflateAll - 启动全部 3 个气泵充气,持续 seconds 秒后自动断开
+ * @param seconds  充气时长(秒,浮点)
+ *
+ * 流程:先断开所有放气继电器(防气路冲突) -> 闭合所有充气继电器
+ *       -> 记录到期时刻,由 loop() 中的定时检查负责断开
+ */
+void startInflateAll(float seconds) {
+  // 先断开放气,避免同一气泵充/放气继电器同时闭合
+  for (int i = 0; i < 3; i++) {
+    setRelay(DEFLATE_PINS[i], false);   // 断开泵(i+1)放气
+    setRelay(INFLATE_PINS[i], true);    // 闭合泵(i+1)充气
+  }
+  // 计算到期时刻 = 当前时刻 + seconds 秒(转毫秒)
+  inflateDeadline = millis() + (unsigned long)(seconds * 1000);
+  inflating = true;   // 标记正在全充气
+}
+
+/**
+ * startDeflateAll - 启动全部 3 个气泵放气,持续 seconds 秒后自动断开
+ * @param seconds  放气时长(秒,浮点)
+ *
+ * 流程:先断开所有充气继电器(防气路冲突) -> 闭合所有放气继电器
+ *       -> 记录到期时刻,由 loop() 中的定时检查负责断开
+ */
+void startDeflateAll(float seconds) {
+  for (int i = 0; i < 3; i++) {
+    setRelay(INFLATE_PINS[i], false);   // 断开泵(i+1)充气
+    setRelay(DEFLATE_PINS[i], true);    // 闭合泵(i+1)放气
+  }
+  deflateDeadline = millis() + (unsigned long)(seconds * 1000);
+  deflating = true;
+}
+
+/**
+ * inflateMain - 执行 INFLATE_M 指令:主气泵点充一次
+ *
+ * 使用 INFLATE_M_PUMP_INDEX 指定的气泵,闭合其充气继电器
+ * INFLATE_M_MS_PER_PUMP[该泵索引] 毫秒后断开。
+ *
+ * 注意:此函数使用 delay() 阻塞,期间无法接收新指令。
+ * 因 INFLATE_M 时长通常 ≤ 1 秒,影响可接受。
+ */
+void inflateMain() {
+  int pumpIdx = INFLATE_M_PUMP_INDEX;           // 选择主气泵索引
+  unsigned long ms = INFLATE_M_MS_PER_PUMP[pumpIdx]; // 该泵的吸气时长
+
+  // 先断开该泵的放气继电器(防气路冲突)
+  setRelay(DEFLATE_PINS[pumpIdx], false);
+  // 闭合该泵的充气继电器 -> 开始吸气
+  setRelay(INFLATE_PINS[pumpIdx], true);
+  // 阻塞等待 ms 毫秒(这就是每次 INFLATE_M 的吸气时长)
+  delay(ms);
+  // 时间到,断开充气继电器 -> 停止吸气
+  setRelay(INFLATE_PINS[pumpIdx], false);
+}
+
+/**
+ * setup - Arduino 上电后执行一次
+ * 初始化串口、引脚,断开所有继电器,打印就绪信息
+ */
+void setup() {
+  Serial.begin(9600);   // 开启串口,波特率 9600(与 Python 端一致)
+  // 将 6 个继电器引脚设为输出模式
+  for (int i = 0; i < 3; i++) {
+    pinMode(INFLATE_PINS[i], OUTPUT);   // 充气引脚
+    pinMode(DEFLATE_PINS[i], OUTPUT);   // 放气引脚
+  }
+  allOff();   // 初始状态:全部继电器断开(安全)
+  Serial.println("Pump Uno-A ready");   // 向 Python 端报告就绪
+}
+
+/**
+ * loop - Arduino 主循环,反复执行
+ *
+ * 每轮做两件事:
+ *   1. 检查串口是否有新指令,有则解析并执行
+ *   2. 检查全充气/全放气是否到期,到期则断开继电器
+ */
+void loop() {
+  // ---- 1. 接收并解析串口指令 ----
+  if (Serial.available()) {                     // 串口缓冲区有数据
+    String line = Serial.readStringUntil('\n'); // 读取一行(到 '\n')
+    line.trim();                                // 去除首尾空白/回车
+
+    if (line.startsWith("INFLATE_ALL,")) {
+      // 指令:INFLATE_ALL,a -> 提取 a 并启动全充气
+      float a = line.substring(12).toFloat();   // 截取逗号后的数字
+      startInflateAll(a);
+    } else if (line.startsWith("DEFLATE_ALL,")) {
+      // 指令:DEFLATE_ALL,b -> 提取 b 并启动全放气
+      float b = line.substring(12).toFloat();
+      startDeflateAll(b);
+    } else if (line == "INFLATE_M") {
+      // 指令:INFLATE_M -> 主气泵点充一次(时长见顶部常量)
+      inflateMain();
+    } else if (line == "STOP_ALL") {
+      // 指令:STOP_ALL -> 立即断开全部继电器
+      allOff();
+    }
+  }
+
+  // ---- 2. 到时自动断开(非阻塞定时)----
+  // 检查全充气是否到期
+  if (inflating && millis() >= inflateDeadline) {
+    for (int i = 0; i < 3; i++) setRelay(INFLATE_PINS[i], false); // 断开所有充气
+    inflating = false;   // 清除标志
+  }
+  // 检查全放气是否到期
+  if (deflating && millis() >= deflateDeadline) {
+    for (int i = 0; i < 3; i++) setRelay(DEFLATE_PINS[i], false); // 断开所有放气
+    deflating = false;
+  }
+}
+
+================================================================================
+★ INFLATE_M 吸气时长修改速查 ★
+--------------------------------------------------------------------------------
+  在 Arduino IDE 中打开本代码,找到文件顶部的【用户可调参数区】:
+
+    1. 修改每个气泵的吸气时长(毫秒):
+         const unsigned long INFLATE_M_MS_PER_PUMP[3] = {1000, 1000, 1000};
+         //                                        泵1    泵2    泵3
+
+    2. 修改 INFLATE_M 使用哪个气泵:
+         const int INFLATE_M_PUMP_INDEX = 0;  // 0=泵1, 1=泵2, 2=泵3
+
+  修改后重新上传至 Uno-A 即可生效。
+================================================================================
+
+注意:本文件为参考文档,Python 程序不会执行本文件。
+      请将上面【Arduino 参考代码】部分复制到 Arduino IDE 并上传至 Uno-A。
+================================================================================

@@ -18,8 +18,9 @@ AVAILABLE_CAMERA_IDS: list = [0, 1, 2]  # 可循环切换的摄像头 ID 列表
 STATIC_IMAGE_MODE: bool = False     # False=视频流模式(更高效)
 MODEL_COMPLEXITY: int = 1           # 0 轻量 / 1 中等 / 2 最准
 SMOOTH_LANDMARKS: bool = True       # 减少关键点抖动
-MIN_DETECTION_CONFIDENCE: float = 0.5
-MIN_TRACKING_CONFIDENCE: float = 0.5
+# 置信度阈值:提高到 0.7/0.6 以降低对椅子/衣架/海报等杂物的误检
+MIN_DETECTION_CONFIDENCE: float = 0.7
+MIN_TRACKING_CONFIDENCE: float = 0.6
 
 
 # ============ 关键点平滑滤波 ============
@@ -29,9 +30,6 @@ SMOOTH_BUFFER_SIZE: int = 5
 
 # ============ 动作识别阈值 ============
 HAND_UP_THRESHOLD: float = 0.05     # 手腕高于鼻子的偏移量(归一化)
-KNEE_ANGLE_STAND: float = 160.0     # 膝关节角度 > 此值判定为站立
-KNEE_ANGLE_SIT: float = 130.0       # 膝关节角度 < 此值判定为坐下
-FALL_RATIO_THRESHOLD: float = 0.3   # 髋肩高度差 / 肩宽 < 此值判定为跌倒
 
 
 # ============ 动作显示 / 冷却 ============
@@ -51,6 +49,31 @@ SERIAL_SEND_NONE: bool = True   # 无动作时是否发送 NONE
 DEFAULT_SERIAL_PORT_WIN: str = "COM3"
 DEFAULT_SERIAL_PORT_LINUX: str = "/dev/ttyUSB0"
 DEFAULT_SERIAL_PORT_MAC: str = "/dev/tty.usbserial*"
+
+
+# ============ Arduino 交互流程配置 ============
+# 充气/放气时间(秒)
+INFLATE_TIME_A: float = 5.0       # INIT 阶段充气时长 a
+DEFLATE_TIME_B: float = 5.0       # DEFLATING 阶段放气时长 b
+
+# 状态机时间阈值(秒)
+PERSON_CONFIRM_N1: float = 3.0    # WAITING 状态确认人在线时长 n1
+COUNT_MIN_N2: float = 5.0         # COUNTING 最短计时 n2
+COUNT_MAX_N3: float = 10.0        # COUNTING 最长计时 n3
+ABSENCE_TIMEOUT_N4: float = 3.0   # 人离开超时阈值 n4(触发安全放气)
+ENDING_TIMEOUT: float = 30.0      # ENDING 状态最长停留秒数(兜底,防止误检导致死锁)
+
+# 循环节奏
+LOOP_INTERVAL: float = 1.0        # INTERVAL 状态间隔秒数
+LOOP_COUNT_MAX: int = 3           # 一轮最多抽取的动作次数
+
+# 充气安全阈值
+GAS_MAX: int = 15                 # INFLATING 累计充气次数上限,达到则强制放气
+
+# 双 Arduino 串口配置
+ARDUINO_BAUDRATE: int = 9600
+PUMP_SERIAL_PORT: str = "COM3"    # Uno-A:控制 3 气泵(6 路继电器)
+LIGHT_SERIAL_PORT: str = "COM4"   # Uno-B:控制灯箱 3 灯泡(3 路继电器)
 
 
 def get_default_serial_port() -> str:

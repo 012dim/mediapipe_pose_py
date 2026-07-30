@@ -1,22 +1,18 @@
 """动作识别模块。
 
-实现 6 种动作的判定逻辑:
+实现 3 种手部动作的判定逻辑:
 - LEFT_HAND_UP    左手举起(左手腕高于鼻子)
 - RIGHT_HAND_UP   右手举起(右手腕高于鼻子)
 - BOTH_HANDS_UP   双手举起(左右手腕同时高于鼻子)
-- STAND           站立(膝关节角度 > 160°)
-- SIT             坐下(膝关节角度 < 130°)
-- FALL_DETECTED   跌倒(髋肩高度差 / 肩宽 < 0.3)
 
 每个动作有冷却时间,避免短时间内重复触发。
 """
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import config
-from modules.angle_calculator import calculate_angle
 from modules.pose_detector import LandmarkPoint, PoseResult
 
 logger = logging.getLogger(__name__)
@@ -29,16 +25,14 @@ LEFT_ELBOW = 13
 RIGHT_ELBOW = 14
 LEFT_WRIST = 15
 RIGHT_WRIST = 16
-LEFT_HIP = 23
-RIGHT_HIP = 24
-LEFT_KNEE = 25
-RIGHT_KNEE = 26
-LEFT_ANKLE = 27
-RIGHT_ANKLE = 28
 
-# 双通道"无动作"状态名
-BODY_NONE = "BODY_NONE"
+# 无动作状态名
 HAND_NONE = "HAND_NONE"
+
+# 动作匹配结果(用于状态机判定 COUNTING 阶段动作正确性)
+MATCH_CORRECT = "MATCH_CORRECT"     # 当前动作 == 目标动作
+MATCH_WRONG = "MATCH_WRONG"         # 当前动作 != 目标 且 != HAND_NONE
+MATCH_NEUTRAL = "MATCH_NEUTRAL"     # 当前动作 == HAND_NONE(中性,不计错误)
 
 
 @dataclass
@@ -56,28 +50,23 @@ class ActionEvent:
 
 
 @dataclass
-class DualChannelState:
-    """双通道动作状态(每帧实时判定,不受冷却限制)。
+class HandActionState:
+    """手部动作状态(每帧实时判定,不受冷却限制)。
 
     Attributes:
-        body_action: 身体通道动作(STAND/SIT/FALL_DETECTED/BODY_NONE)。
-        hand_action: 手部通道动作(BOTH_HANDS_UP/LEFT_HAND_UP/RIGHT_HAND_UP/HAND_NONE)。
+        hand_action: 手部动作(BOTH_HANDS_UP / LEFT_HAND_UP / RIGHT_HAND_UP / HAND_NONE)。
         timestamp: 判定时间戳(time.time)。
     """
-    body_action: str
     hand_action: str
     timestamp: float
 
 
 class ActionRecognizer:
-    """动作识别器,基于关键点坐标判断动作并管理冷却。
+    """动作识别器,基于关键点坐标判断手部动作并管理冷却。
 
     Attributes:
         cooldown: 动作冷却时间(秒)。
         hand_threshold: 手腕高于鼻子的偏移阈值。
-        knee_angle_stand: 站立角度阈值。
-        knee_angle_sit: 坐下角度阈值。
-        fall_ratio_threshold: 跌倒比率阈值。
     """
 
     # 动作事件名 -> 中文显示名
@@ -85,10 +74,6 @@ class ActionRecognizer:
         "LEFT_HAND_UP": "左手举起",
         "RIGHT_HAND_UP": "右手举起",
         "BOTH_HANDS_UP": "双手举起",
-        "STAND": "站立",
-        "SIT": "坐下",
-        "FALL_DETECTED": "跌倒",
-        "BODY_NONE": "无身体动作",
         "HAND_NONE": "无手部动作",
     }
 
@@ -96,24 +81,15 @@ class ActionRecognizer:
         self,
         cooldown: float = config.ACTION_COOLDOWN,
         hand_threshold: float = config.HAND_UP_THRESHOLD,
-        knee_angle_stand: float = config.KNEE_ANGLE_STAND,
-        knee_angle_sit: float = config.KNEE_ANGLE_SIT,
-        fall_ratio_threshold: float = config.FALL_RATIO_THRESHOLD,
     ) -> None:
         """初始化动作识别器。
 
         Args:
             cooldown: 动作冷却时间(秒)。
             hand_threshold: 手腕高于鼻子的偏移阈值(归一化)。
-            knee_angle_stand: 站立膝关节角度阈值。
-            knee_angle_sit: 坐下膝关节角度阈值。
-            fall_ratio_threshold: 跌倒比率阈值。
         """
         self.cooldown: float = cooldown
         self.hand_threshold: float = hand_threshold
-        self.knee_angle_stand: float = knee_angle_stand
-        self.knee_angle_sit: float = knee_angle_sit
-        self.fall_ratio_threshold: float = fall_ratio_threshold
 
         # 动作名 -> 上次触发时间戳
         self._last_trigger: dict = {}
@@ -121,7 +97,7 @@ class ActionRecognizer:
         self.recent_actions: List[ActionEvent] = []
 
     def recognize(self, pose_result: PoseResult) -> Optional[ActionEvent]:
-        """对一帧姿态结果进行动作识别。
+        """对一帧姿态结果进行手部动作识别。
 
         Args:
             pose_result: PoseDetector 输出的姿态结果。
@@ -133,8 +109,7 @@ class ActionRecognizer:
             return None
         lm = pose_result.landmarks
 
-        # 候选动作列表(按优先级顺序检测)
-        candidates = self._detect_candidates(lm)
+        candidates = self._detect_hand_candidates(lm)
 
         for action_name in candidates:
             if self._can_trigger(action_name):
@@ -147,50 +122,29 @@ class ActionRecognizer:
                 return event
         return None
 
-    def recognize_current(self, pose_result: PoseResult) -> DualChannelState:
-        """对一帧姿态结果进行双通道实时判定(不受冷却限制)。
-
-        身体通道: STAND / SIT / FALL_DETECTED / BODY_NONE
-        手部通道: BOTH_HANDS_UP / LEFT_HAND_UP / RIGHT_HAND_UP / HAND_NONE
+    def recognize_current(self, pose_result: PoseResult) -> HandActionState:
+        """对一帧姿态结果进行手部实时判定(不受冷却限制)。
 
         Args:
             pose_result: PoseDetector 输出的姿态结果。
 
         Returns:
-            DualChannelState: 当前帧的双通道状态。
+            HandActionState: 当前帧的手部动作状态。
         """
         if not pose_result.person_detected or pose_result.landmarks is None:
-            return DualChannelState(BODY_NONE, HAND_NONE, time.time())
+            return HandActionState(HAND_NONE, time.time())
         lm = pose_result.landmarks
-        return DualChannelState(
-            self._detect_body_action(lm),
+        return HandActionState(
             self._detect_hand_action(lm),
             time.time(),
         )
 
-    def _detect_body_action(self, lm: List[LandmarkPoint]) -> str:
-        """判定身体通道动作。
-
-        优先级: 跌倒 > 坐/站。膝关节角度 < sit 阈值判坐,
-        否则(含 130~160° 灰色地带)归为站立。
-
-        Args:
-            lm: 33 个关键点列表。
-
-        Returns:
-            str: STAND / SIT / FALL_DETECTED / BODY_NONE。
-        """
-        if self._check_fall(lm):
-            return "FALL_DETECTED"
-        knee_angle = self._calc_knee_angle(lm)
-        if knee_angle is None:
-            return BODY_NONE
-        if knee_angle < self.knee_angle_sit:   # < 130° → SIT
-            return "SIT"
-        return "STAND"                          # >= 130° 算站立(含灰色地带)
-
     def _detect_hand_action(self, lm: List[LandmarkPoint]) -> str:
-        """判定手部通道动作。
+        """判定手部动作。
+
+        注意:主循环对画面做了水平翻转(镜像),因此 MediaPipe 的
+        LEFT_WRIST 实际对应用户右手,RIGHT_WRIST 对应用户左手,
+        判定时需交换两者,使识别结果与用户直觉一致。
 
         Args:
             lm: 33 个关键点列表。
@@ -198,8 +152,9 @@ class ActionRecognizer:
         Returns:
             str: BOTH_HANDS_UP / LEFT_HAND_UP / RIGHT_HAND_UP / HAND_NONE。
         """
-        left_up = self._is_hand_up(lm[LEFT_WRIST], lm[NOSE])
-        right_up = self._is_hand_up(lm[RIGHT_WRIST], lm[NOSE])
+        # 画面镜像:MediaPipe 的 LEFT_WRIST=用户右手,RIGHT_WRIST=用户左手
+        left_up = self._is_hand_up(lm[RIGHT_WRIST], lm[NOSE])
+        right_up = self._is_hand_up(lm[LEFT_WRIST], lm[NOSE])
         if left_up and right_up:
             return "BOTH_HANDS_UP"
         if left_up:
@@ -208,11 +163,11 @@ class ActionRecognizer:
             return "RIGHT_HAND_UP"
         return HAND_NONE
 
-    def _detect_candidates(self, lm: List[LandmarkPoint]) -> List[str]:
-        """检测本帧所有满足条件的候选动作(按优先级排序)。
+    def _detect_hand_candidates(self, lm: List[LandmarkPoint]) -> List[str]:
+        """检测本帧满足条件的手部候选动作(按优先级排序)。
 
-        优先级:跌倒 > 双手 > 单手 > 站坐。
-        若触发高级别动作,则不再考虑低级别。
+        优先级:双手 > 单手。
+        注意:画面水平翻转(镜像),LEFT_WRIST/RIGHT_WRIST 需交换判定。
 
         Args:
             lm: 33 个关键点列表。
@@ -221,15 +176,9 @@ class ActionRecognizer:
             List[str]: 候选动作名列表(按优先级降序)。
         """
         candidates: List[str] = []
-
-        # 1) 跌倒:髋肩高度差 / 肩宽 < 阈值
-        fall = self._check_fall(lm)
-        if fall:
-            candidates.append("FALL_DETECTED")
-
-        # 2) 双手举起
-        left_up = self._is_hand_up(lm[LEFT_WRIST], lm[NOSE])
-        right_up = self._is_hand_up(lm[RIGHT_WRIST], lm[NOSE])
+        # 画面镜像:MediaPipe 的 LEFT_WRIST=用户右手,RIGHT_WRIST=用户左手
+        left_up = self._is_hand_up(lm[RIGHT_WRIST], lm[NOSE])
+        right_up = self._is_hand_up(lm[LEFT_WRIST], lm[NOSE])
         if left_up and right_up:
             candidates.append("BOTH_HANDS_UP")
         else:
@@ -237,15 +186,6 @@ class ActionRecognizer:
                 candidates.append("LEFT_HAND_UP")
             if right_up:
                 candidates.append("RIGHT_HAND_UP")
-
-        # 3) 站立 / 坐下(基于膝关节角度)
-        knee_angle = self._calc_knee_angle(lm)
-        if knee_angle is not None:
-            if knee_angle > self.knee_angle_stand:
-                candidates.append("STAND")
-            elif knee_angle < self.knee_angle_sit:
-                candidates.append("SIT")
-
         return candidates
 
     def _is_hand_up(self, wrist: LandmarkPoint, nose: LandmarkPoint) -> bool:
@@ -261,62 +201,6 @@ class ActionRecognizer:
             bool: 手腕高于鼻子一定距离返回 True。
         """
         return wrist.y < (nose.y - self.hand_threshold)
-
-    def _calc_knee_angle(self, lm: List[LandmarkPoint]) -> Optional[float]:
-        """计算左右膝关节角度的平均值。
-
-        Args:
-            lm: 33 个关键点列表。
-
-        Returns:
-            Optional[float]: 平均膝关节角度(度),不可见时返回 None。
-        """
-        try:
-            left = calculate_angle(
-                (lm[LEFT_HIP].x, lm[LEFT_HIP].y),
-                (lm[LEFT_KNEE].x, lm[LEFT_KNEE].y),
-                (lm[LEFT_ANKLE].x, lm[LEFT_ANKLE].y),
-            )
-            right = calculate_angle(
-                (lm[RIGHT_HIP].x, lm[RIGHT_HIP].y),
-                (lm[RIGHT_KNEE].x, lm[RIGHT_KNEE].y),
-                (lm[RIGHT_ANKLE].x, lm[RIGHT_ANKLE].y),
-            )
-            return (left + right) / 2.0
-        except Exception as e:  # noqa: BLE001
-            logger.warning("计算膝关节角度失败: %s", e)
-            return None
-
-    def _check_fall(self, lm: List[LandmarkPoint]) -> bool:
-        """判断是否跌倒(髋肩高度差 / 肩宽 < 阈值)。
-
-        站立时:肩在髋上方,y 差大,且肩宽正常,比值 > 阈值。
-        跌倒时:身体接近水平,肩髋 Y 接近,比值变小,< 阈值。
-
-        Args:
-            lm: 33 个关键点列表。
-
-        Returns:
-            bool: 判定为跌倒返回 True。
-        """
-        try:
-            shoulder_dy = abs(lm[LEFT_SHOULDER].y - lm[RIGHT_SHOULDER].y)
-            # 髋肩平均高度差
-            shoulder_y = (lm[LEFT_SHOULDER].y + lm[RIGHT_SHOULDER].y) / 2.0
-            hip_y = (lm[LEFT_HIP].y + lm[RIGHT_HIP].y) / 2.0
-            height_diff = abs(shoulder_y - hip_y)
-            # 肩宽
-            shoulder_width = abs(lm[LEFT_SHOULDER].x - lm[RIGHT_SHOULDER].x)
-            if shoulder_width < 1e-3:
-                return False
-            ratio = height_diff / shoulder_width
-            # 肩部本身不水平(头部歪斜)也忽略
-            if shoulder_dy > 0.2:
-                return False
-            return ratio < self.fall_ratio_threshold
-        except Exception as e:  # noqa: BLE001
-            logger.warning("跌倒判定异常: %s", e)
-            return False
 
     def _can_trigger(self, action_name: str) -> bool:
         """判断指定动作是否已过冷却期。
@@ -352,3 +236,24 @@ class ActionRecognizer:
         self._last_trigger.clear()
         self.recent_actions.clear()
         logger.info("动作识别状态已重置")
+
+    @staticmethod
+    def check_match(target: str, hand: str) -> str:
+        """判断当前手部动作与目标动作的匹配关系(供状态机使用)。
+
+        规则:
+            - hand == target  -> MATCH_CORRECT
+            - hand != target(含 HAND_NONE) -> MATCH_WRONG
+
+        无动作(HAND_NONE)也视为错误,触发惩罚充气。
+
+        Args:
+            target: 目标动作名(LEFT_HAND_UP / RIGHT_HAND_UP / BOTH_HANDS_UP)。
+            hand: 当前帧识别到的手部动作名。
+
+        Returns:
+            str: MATCH_CORRECT / MATCH_WRONG。
+        """
+        if hand == target:
+            return MATCH_CORRECT
+        return MATCH_WRONG

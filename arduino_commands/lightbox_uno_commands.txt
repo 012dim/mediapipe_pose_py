@@ -1,0 +1,207 @@
+================================================================================
+灯箱控制 Arduino Uno (Uno-B) 程序说明
+================================================================================
+
+【硬件接线】
+  Uno-B 控制 3 个灯泡,通过 3 路继电器模块驱动:
+    - 每个灯泡占用 1 路继电器(通/断电控制亮灭)。
+    - 继电器为低电平触发(常见 5V 继电器模块)。
+
+  Arduino Uno 引脚 -> 继电器映射:
+
+    引脚    继电器编号    灯泡    对应动作
+    ----    ----------    ----    ----------
+    D2      RELAY1        灯1     LEFT_HAND_UP   (左手举起)
+    D3      RELAY2        灯2     RIGHT_HAND_UP  (右手举起)
+    D4      RELAY3        灯3     BOTH_HANDS_UP  (双手举起)
+
+【串口协议】
+  波特率 9600,每行一条指令,以 '\n' 结尾。
+
+  指令格式              含义
+  ------------------    ------------------------------------------------
+  LIGHT_ON,id           点亮指定编号灯泡(id ∈ {1,2,3})
+                        例如 "LIGHT_ON,1" 点亮灯1
+  LIGHT_OFF,id          熄灭指定编号灯泡
+  LIGHT_ALL_OFF         全部 3 个灯泡熄灭
+  LIGHT_FLASH,3         三灯同时闪烁 3 次(用于 ENDING 结束阶段)
+                        每次亮 300ms、灭 300ms
+
+【与状态机的配合】
+  状态机(Python 端)在以下时机发送指令:
+    EXTRACTING   抽到目标动作后,发送 LIGHT_ON,<对应灯编号>
+                 LEFT_HAND_UP  -> LIGHT_ON,1
+                 RIGHT_HAND_UP -> LIGHT_ON,2
+                 BOTH_HANDS_UP -> LIGHT_ON,3
+    INTERVAL     进入时发送 LIGHT_ALL_OFF(灭灯)
+    ENDING       进入时发送 LIGHT_FLASH,3(三灯闪 3 次)
+    DEFLATING    进入时发送 LIGHT_ALL_OFF(灭灯,确保结束)
+    安全放气     发送 STOP_ALL(气泵) -> LIGHT_ALL_OFF -> DEFLATE_ALL(气泵)
+
+================================================================================
+【Arduino 参考代码(复制到 Arduino IDE 上传至 Uno-B)】
+================================================================================
+
+/*
+ * 灯箱控制 Uno-B
+ * 接收串口指令控制 3 路继电器(3 个灯泡)
+ *
+ * 串口协议(9600 baud,每行一条指令,以 '\n' 结尾):
+ *   LIGHT_ON,id     点亮指定灯(id=1/2/3)
+ *   LIGHT_OFF,id    熄灭指定灯
+ *   LIGHT_ALL_OFF   全部熄灭
+ *   LIGHT_FLASH,n   三灯闪烁 n 次
+ */
+
+/* =====================================================================
+ * ★★★ 用户可调参数区(在 Arduino IDE 中修改此处即可)★★★
+ * ===================================================================== */
+
+// ---- 引脚定义 ----
+// LIGHT_PINS:3 个灯泡的继电器引脚,分别对应灯1/灯2/灯3
+//   引脚号 2/3/4 对应硬件接线表中的 D2/D3/D4
+//   灯1 -> LEFT_HAND_UP(左手举起)
+//   灯2 -> RIGHT_HAND_UP(右手举起)
+//   灯3 -> BOTH_HANDS_UP(双手举起)
+const int LIGHT_PINS[3] = {2, 3, 4};
+
+// ---- 继电器触发电平 ----
+// 常见 5V 继电器模块为【低电平触发】:
+//   true  -> 输出 LOW 时继电器闭合(灯亮)
+//   false -> 输出 HIGH 时继电器闭合(灯亮)
+// 若你的继电器模块是高电平触发,改为 false
+const bool RELAY_ACTIVE_LOW = true;
+
+// ---- 闪烁参数(用于 LIGHT_FLASH 指令)----
+// 每次闪烁:亮 FLASH_ON_MS 毫秒,灭 FLASH_OFF_MS 毫秒
+const unsigned long FLASH_ON_MS = 300;   // 闪烁时灯亮时长(毫秒)
+const unsigned long FLASH_OFF_MS = 300;  // 闪烁时灯灭时长(毫秒)
+
+/* =====================================================================
+ * 用户可调参数区结束
+ * ===================================================================== */
+
+
+/**
+ * setLight - 控制单个灯泡亮/灭
+ * @param idx  灯泡索引(0=灯1, 1=灯2, 2=灯3)
+ * @param on   true=亮, false=灭
+ *
+ * 根据 RELAY_ACTIVE_LOW 自动换算电平:
+ *   低电平触发模块:灯亮时输出 LOW,灯灭时输出 HIGH
+ *   高电平触发模块:灯亮时输出 HIGH,灯灭时输出 LOW
+ *
+ * 越界保护:idx 不在 0~2 范围内则直接返回,不做任何操作
+ */
+void setLight(int idx, bool on) {
+  if (idx < 0 || idx >= 3) return;   // 越界保护,防止非法索引
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(LIGHT_PINS[idx], on ? LOW : HIGH);   // 低触发:亮=LOW
+  } else {
+    digitalWrite(LIGHT_PINS[idx], on ? HIGH : LOW);   // 高触发:亮=HIGH
+  }
+}
+
+/**
+ * allOff - 熄灭全部 3 个灯泡
+ * 供 LIGHT_ALL_OFF 指令、初始化、闪烁结束时调用
+ */
+void allOff() {
+  for (int i = 0; i < 3; i++) setLight(i, false);   // 逐个熄灭
+}
+
+/**
+ * allOn - 点亮全部 3 个灯泡
+ * 供闪烁函数 flashAll 调用
+ */
+void allOn() {
+  for (int i = 0; i < 3; i++) setLight(i, true);    // 逐个点亮
+}
+
+/**
+ * flashAll - 三灯同时闪烁指定次数
+ * @param times  闪烁次数(如 ENDING 阶段传入 3)
+ *
+ * 每次循环:三灯全亮 -> 延时 FLASH_ON_MS -> 三灯全灭 -> 延时 FLASH_OFF_MS
+ * 注意:此函数使用 delay() 阻塞,期间无法接收新指令。
+ *       闪烁总时长 = times × (FLASH_ON_MS + FLASH_OFF_MS)
+ *       默认 3 次 × (300+300)ms = 1.8 秒,影响可接受。
+ */
+void flashAll(int times) {
+  for (int n = 0; n < times; n++) {   // 循环 times 次
+    allOn();                          // 三灯全亮
+    delay(FLASH_ON_MS);               // 保持亮 FLASH_ON_MS 毫秒
+    allOff();                         // 三灯全灭
+    delay(FLASH_OFF_MS);              // 保持灭 FLASH_OFF_MS 毫秒
+  }
+}
+
+/**
+ * setup - Arduino 上电后执行一次
+ * 初始化串口、引脚,熄灭所有灯泡,打印就绪信息
+ */
+void setup() {
+  Serial.begin(9600);   // 开启串口,波特率 9600(与 Python 端一致)
+  // 将 3 个灯泡引脚设为输出模式
+  for (int i = 0; i < 3; i++) {
+    pinMode(LIGHT_PINS[i], OUTPUT);   // 灯(i+1)继电器引脚
+  }
+  allOff();   // 初始状态:全部灯泡熄灭(安全)
+  Serial.println("Lightbox Uno-B ready");   // 向 Python 端报告就绪
+}
+
+/**
+ * loop - Arduino 主循环,反复执行
+ *
+ * 每轮检查串口是否有新指令,有则解析并执行。
+ * 灯泡状态为持续保持(点亮后一直亮,直到收到熄灭指令),无需定时检查。
+ */
+void loop() {
+  if (Serial.available()) {                     // 串口缓冲区有数据
+    String line = Serial.readStringUntil('\n'); // 读取一行(到 '\n')
+    line.trim();                                // 去除首尾空白/回车
+
+    if (line.startsWith("LIGHT_ON,")) {
+      // 指令:LIGHT_ON,id -> 点亮指定灯
+      // substring(9) 截取 "LIGHT_ON," 之后的数字部分
+      int id = line.substring(9).toInt();       // 解析灯号(1/2/3)
+      if (id >= 1 && id <= 3) setLight(id - 1, true);  // id 转 0 基索引
+    } else if (line.startsWith("LIGHT_OFF,")) {
+      // 指令:LIGHT_OFF,id -> 熄灭指定灯
+      // substring(10) 截取 "LIGHT_OFF," 之后的数字部分
+      int id = line.substring(10).toInt();
+      if (id >= 1 && id <= 3) setLight(id - 1, false);
+    } else if (line == "LIGHT_ALL_OFF") {
+      // 指令:LIGHT_ALL_OFF -> 全部熄灭
+      allOff();
+    } else if (line.startsWith("LIGHT_FLASH,")) {
+      // 指令:LIGHT_FLASH,n -> 三灯闪烁 n 次
+      // substring(12) 截取 "LIGHT_FLASH," 之后的数字部分
+      int times = line.substring(12).toInt();
+      if (times <= 0) times = 3;   // 容错:未指定或非法时默认闪 3 次
+      flashAll(times);
+    }
+  }
+}
+
+================================================================================
+★ 灯泡参数修改速查 ★
+--------------------------------------------------------------------------------
+  在 Arduino IDE 中打开本代码,找到文件顶部的【用户可调参数区】:
+
+    1. 修改灯泡继电器引脚:
+         const int LIGHT_PINS[3] = {2, 3, 4};  // 灯1/灯2/灯3
+
+    2. 修改继电器触发电平(低电平触发 vs 高电平触发):
+         const bool RELAY_ACTIVE_LOW = true;   // true=低触发, false=高触发
+
+    3. 修改闪烁时长(ENDING 结束阶段三灯闪烁的亮/灭时长):
+         const unsigned long FLASH_ON_MS = 300;   // 亮 300ms
+         const unsigned long FLASH_OFF_MS = 300;  // 灭 300ms
+
+  修改后重新上传至 Uno-B 即可生效。
+================================================================================
+
+注意:本文件为参考文档,Python 程序不会执行本文件。
+      请将上面【Arduino 参考代码】部分复制到 Arduino IDE 并上传至 Uno-B。
+================================================================================

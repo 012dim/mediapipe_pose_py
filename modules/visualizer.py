@@ -19,8 +19,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import config
-from modules.action_recognizer import ActionEvent, ActionRecognizer, BODY_NONE, HAND_NONE
+from modules.action_recognizer import ActionEvent, ActionRecognizer, HAND_NONE, HandActionState
 from modules.pose_detector import PoseResult, LandmarkPoint, mp_pose, mp_drawing
+from modules.state_machine import StateSnapshot, STATE_DISPLAY_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +96,7 @@ COLOR_FPS = (0, 255, 0)
 COLOR_INFO = (0, 255, 255)
 COLOR_ACTION = (0, 100, 255)
 COLOR_RECENT = (200, 200, 200)
-COLOR_BODY = (255, 120, 0)      # 身体通道(蓝)
-COLOR_HAND = (0, 165, 255)      # 手部通道(橙)
+COLOR_HAND = (0, 165, 255)      # 手部动作(橙)
 COLOR_NONE = (128, 128, 128)    # 无动作(灰)
 
 
@@ -152,8 +152,10 @@ class Visualizer:
         # 当前正在屏幕底部高亮显示的动作(事件 + 过期时间)
         self._active_event: Optional[ActionEvent] = None
         self._active_expire: float = 0.0
-        # 当前双通道状态(每帧实时刷新)
+        # 当前手部动作状态(每帧实时刷新)
         self._current_state = None
+        # 状态机快照(每帧由主循环设置)
+        self._state_snapshot: Optional[StateSnapshot] = None
 
     def toggle_skeleton(self) -> None:
         """切换骨骼显示状态(按 f 键)。"""
@@ -169,13 +171,21 @@ class Visualizer:
         self._active_event = event
         self._active_expire = time.time() + config.ACTION_DISPLAY_DURATION
 
-    def set_current_state(self, state) -> None:
-        """每帧调用,设置当前双通道状态,屏幕实时刷新。
+    def set_current_state(self, state: HandActionState) -> None:
+        """每帧调用,设置当前手部动作状态,屏幕实时刷新。
 
         Args:
-            state: DualChannelState 实例(body_action + hand_action)。
+            state: HandActionState 实例(hand_action)。
         """
         self._current_state = state
+
+    def set_state_snapshot(self, snapshot: StateSnapshot) -> None:
+        """每帧由主循环调用,设置状态机快照供可视化显示。
+
+        Args:
+            snapshot: StateSnapshot 实例。
+        """
+        self._state_snapshot = snapshot
 
     def draw(
         self,
@@ -213,10 +223,13 @@ class Visualizer:
         # 4) 底部最近动作
         out = self._draw_recent_actions(out, recent_actions)
 
-        # 5) 底部双通道当前状态(每帧实时刷新)
-        out = self._draw_dual_channel_state(out)
+        # 5) 底部手部当前状态(每帧实时刷新)
+        out = self._draw_hand_state(out)
 
-        # 6) 帮助提示
+        # 6) 状态机面板(左下角:状态/计时/gass/目标)
+        out = self._draw_state_machine(out)
+
+        # 7) 帮助提示
         self._draw_help(out)
 
         return out
@@ -368,8 +381,8 @@ class Visualizer:
             cv2.FONT_HERSHEY_SIMPLEX, 1.6, COLOR_ACTION, 3,
         )
 
-    def _draw_dual_channel_state(self, frame: np.ndarray) -> np.ndarray:
-        """屏幕底部并排绘制身体(蓝)+手部(橙)双通道当前状态,每帧实时刷新。
+    def _draw_hand_state(self, frame: np.ndarray) -> np.ndarray:
+        """屏幕底部绘制手部当前状态,每帧实时刷新。
 
         无动作时显示灰色。无 2 秒过期机制,始终显示当前状态。
 
@@ -384,23 +397,18 @@ class Visualizer:
         h, w = frame.shape[:2]
         state = self._current_state
         names = ActionRecognizer.ACTION_DISPLAY_NAMES
-        body_disp = names.get(state.body_action, state.body_action)
         hand_disp = names.get(state.hand_action, state.hand_action)
-        body_text = f"身体: {body_disp}"
         hand_text = f"手部: {hand_disp}"
-        body_color = COLOR_NONE if state.body_action == BODY_NONE else COLOR_BODY
         hand_color = COLOR_NONE if state.hand_action == HAND_NONE else COLOR_HAND
 
-        # 底部中央并排两个标签(位于最近动作列表上方)
+        # 底部中央单个标签(位于最近动作列表上方)
         y = h - 95
-        body_x = w // 2 - 200
-        hand_x = w // 2 + 20
+        box_w = 200
+        x = (w - box_w) // 2
         # 背景框
-        cv2.rectangle(frame, (body_x - 8, y - 24), (body_x + 180, y + 6), (0, 0, 0), -1)
-        cv2.rectangle(frame, (hand_x - 8, y - 24), (hand_x + 180, y + 6), (0, 0, 0), -1)
+        cv2.rectangle(frame, (x - 8, y - 24), (x + box_w, y + 6), (0, 0, 0), -1)
         # 文字(PIL 中文渲染)
-        frame = cv2_put_chinese_text(frame, body_text, (body_x, y - 22), body_color, font_size=18)
-        frame = cv2_put_chinese_text(frame, hand_text, (hand_x, y - 22), hand_color, font_size=18)
+        frame = cv2_put_chinese_text(frame, hand_text, (x, y - 22), hand_color, font_size=18)
         return frame
 
     def _draw_help(self, frame: np.ndarray) -> None:
@@ -411,6 +419,135 @@ class Visualizer:
         x = (w - text_size[0]) // 2
         cv2.rectangle(frame, (x - 6, 44), (x + text_size[0] + 6, 64), (0, 0, 0), -1)
         cv2.putText(frame, help_text, (x, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+    def _draw_state_machine(self, frame: np.ndarray) -> np.ndarray:
+        """在画面右侧绘制状态机面板:状态名/计时进度条/gass/目标动作。
+
+        布局:
+            右上角下方竖排显示:
+            [状态] 状态名(中文)
+            [计时] 剩余 X.X 秒  + 进度条
+            [充气] gass / GAS_MAX
+            [进度] 第 n / LOOP_COUNT_MAX 题
+            [目标] 动作名(仅 COUNTING/INFLATING)
+
+        Args:
+            frame: 目标帧。
+
+        Returns:
+            np.ndarray: 绘制后的帧。
+        """
+        if self._state_snapshot is None:
+            return frame
+        snap = self._state_snapshot
+        h, w = frame.shape[:2]
+
+        # 面板位置:右上角下方,宽度 240
+        panel_w = 240
+        panel_x = w - panel_w - 8
+        panel_y = 50
+        panel_h = 185
+        # 半透明背景
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y),
+                      (panel_x + panel_w, panel_y + panel_h),
+                      (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.rectangle(frame, (panel_x, panel_y),
+                      (panel_x + panel_w, panel_y + panel_h),
+                      (180, 180, 180), 1)
+
+        # 状态名(大字)
+        state_text = f"状态: {snap.state_display}"
+        frame = cv2_put_chinese_text(
+            frame, state_text, (panel_x + 8, panel_y + 6),
+            (0, 255, 255), font_size=20,
+        )
+
+        # 计时 / 等人提示
+        # WAITING 且当前帧无可靠人:显示灰色"等待人物出现...",不画进度条
+        # WAITING 且有可靠人:显示绿色倒计时 + 进度条
+        show_bar = True
+        if snap.state == "WAITING" and snap.no_person:
+            timer_text = "等待人物出现..."
+            timer_color = (128, 128, 128)
+            show_bar = False
+        elif snap.time_remaining >= 0:
+            timer_text = f"剩余: {snap.time_remaining:.1f} 秒"
+            timer_color = (255, 255, 255)
+        else:
+            timer_text = "剩余: --"
+            timer_color = (255, 255, 255)
+            show_bar = False
+        frame = cv2_put_chinese_text(
+            frame, timer_text, (panel_x + 8, panel_y + 34),
+            timer_color, font_size=16,
+        )
+        # 进度条(仅在有明确计时进度时绘制)
+        if show_bar:
+            bar_x = panel_x + 8
+            bar_y = panel_y + 58
+            bar_w = panel_w - 16
+            bar_h = 8
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
+                          (60, 60, 60), -1)
+            fill_w = int(bar_w * snap.progress)
+            bar_color = (0, 200, 0) if snap.progress < 0.7 else (0, 165, 255)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h),
+                          bar_color, -1)
+
+        # gass
+        gass_color = (0, 200, 0) if snap.gass < config.GAS_MAX else (0, 0, 255)
+        gass_text = f"充气: {snap.gass} / {config.GAS_MAX}"
+        frame = cv2_put_chinese_text(
+            frame, gass_text, (panel_x + 8, panel_y + 72),
+            gass_color, font_size=16,
+        )
+
+        # 题目进度
+        n_text = f"题目: {snap.n_count} / {config.LOOP_COUNT_MAX}"
+        frame = cv2_put_chinese_text(
+            frame, n_text, (panel_x + 8, panel_y + 94),
+            (255, 255, 255), font_size=16,
+        )
+
+        # 目标动作
+        if snap.state in ("COUNTING", "INFLATING"):
+            target_disp = ActionRecognizer.ACTION_DISPLAY_NAMES.get(
+                snap.target_action, snap.target_action,
+            )
+            target_text = f"目标: {target_disp}"
+            frame = cv2_put_chinese_text(
+                frame, target_text, (panel_x + 8, panel_y + 116),
+                (0, 165, 255), font_size=16,
+            )
+
+        # 灯泡状态:三个圆(亮=黄,灭=灰)
+        frame = cv2_put_chinese_text(
+            frame, "灯泡:", (panel_x + 8, panel_y + 138),
+            (255, 255, 255), font_size=16,
+        )
+        for i, lid in enumerate((1, 2, 3)):
+            cx = panel_x + 72 + i * 48
+            cy = panel_y + 146
+            on = lid in snap.lights_on
+            color = (0, 255, 255) if on else (90, 90, 90)
+            cv2.circle(frame, (cx, cy), 8, color, -1)
+            cv2.circle(frame, (cx, cy), 8, (200, 200, 200), 1)
+            # 灯号
+            frame = cv2_put_chinese_text(
+                frame, str(lid), (cx - 4, cy + 11),
+                (200, 200, 200), font_size=12,
+            )
+
+        # 充气锁定提示(gass 达上限后,后续充气指令不触发)
+        if snap.inflate_locked:
+            frame = cv2_put_chinese_text(
+                frame, "充气已锁定!", (panel_x + 8, panel_y + 164),
+                (0, 0, 255), font_size=16,
+            )
+
+        return frame
 
     @staticmethod
     def _to_mp_landmark_list(landmarks: Optional[List[LandmarkPoint]]):
