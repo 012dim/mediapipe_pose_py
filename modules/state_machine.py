@@ -36,7 +36,7 @@ from modules.action_recognizer import (
     MATCH_WRONG,
 )
 from modules.pose_detector import LandmarkPoint, PoseResult
-from modules.serial_sender import LightSender, PumpSender
+from modules.serial_sender import LightSender, PumpGroupSender
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ STATE_INFLATING = "INFLATING"
 STATE_INTERVAL = "INTERVAL"
 STATE_ENDING = "ENDING"
 STATE_DEFLATING = "DEFLATING"
+STATE_SAFE_STOP = "SAFE_STOP"   # 安全停止:任一泵控板发送失败,全组停机放气后等待退出
 
 # 候选动作池
 ACTION_POOL = ("LEFT_HAND_UP", "RIGHT_HAND_UP", "BOTH_HANDS_UP")
@@ -70,6 +71,7 @@ STATE_DISPLAY_NAMES: Dict[str, str] = {
     STATE_INTERVAL: "间隔",
     STATE_ENDING: "结束",
     STATE_DEFLATING: "放气",
+    STATE_SAFE_STOP: "安全停止",
 }
 
 
@@ -107,7 +109,8 @@ class StateMachine:
     """8 状态有限状态机。
 
     主循环每帧调用 update(person_detected, hand_action),返回 StateSnapshot。
-    所有串口发送失败均由 PumpSender/LightSender 内部容错,不影响状态流转。
+    所有串口发送失败均由 PumpGroupSender/LightSender 内部容错;泵组任一板
+    发送失败会触发 stop_all_best_effort 并进入 SAFE_STOP 态。
     """
 
     # 在这些状态下,人消失 ≥ n4 触发安全放气
@@ -116,14 +119,14 @@ class StateMachine:
         STATE_INTERVAL, STATE_ENDING,
     })
 
-    def __init__(self, pump: PumpSender, light: LightSender) -> None:
+    def __init__(self, pump: PumpGroupSender, light: LightSender) -> None:
         """初始化状态机。
 
         Args:
-            pump: 气泵串口发送器(Uno-A)。
-            light: 灯箱串口发送器(Uno-B)。
+            pump: 泵组发送器(3 块泵控 UNO: PUMP_A/B/C)。
+            light: 灯箱串口发送器(第 4 块 UNO)。
         """
-        self.pump: PumpSender = pump
+        self.pump: PumpGroupSender = pump
         self.light: LightSender = light
 
         # 状态变量
@@ -210,7 +213,9 @@ class StateMachine:
         self._person_confirm_elapsed = 0.0
         self._counting_duration = 0.0
         self._counting_elapsed = 0.0
-        self.pump.send_inflate_all(config.INFLATE_TIME_A)
+        if not self.pump.send_inflate_all(config.INFLATE_TIME_A):
+            self._enter_safe_stop()
+            return
         logger.info("[INIT] 充气 %d 秒", config.INFLATE_TIME_A)
 
     def _enter_waiting(self) -> None:
@@ -277,10 +282,27 @@ class StateMachine:
     def _enter_deflating(self) -> None:
         self.state = STATE_DEFLATING
         self._state_enter_time = time.time()
-        self.pump.send_deflate_all(config.DEFLATE_TIME_B)
+        if not self.pump.send_deflate_all(config.DEFLATE_TIME_B):
+            self._enter_safe_stop()
+            return
         self.light.send_all_off()
         self._lights_on = set()
         logger.info("[DEFLATING] 放气 %d 秒", config.DEFLATE_TIME_B)
+
+    def _enter_safe_stop(self) -> None:
+        """安全停止态:任一泵控板发送失败时进入。
+
+        PumpGroupSender 内部已 best-effort 广播 STOP_ALL,此处再尝试放气,
+        放气满 SAFE_STOP_DEFLATE_TIME 秒后保持等待退出(不自动恢复)。
+        """
+        self.state = STATE_SAFE_STOP
+        self._state_enter_time = time.time()
+        self._lights_on = set()
+        # best-effort 尝试放气(可能也失败,但尽力)
+        self.pump.send_deflate_all(config.SAFE_STOP_DEFLATE_TIME)
+        self.light.send_all_off()
+        logger.error("[SAFE_STOP] 泵控板发送失败,全组停机,放气 %.1f 秒后等待用户退出",
+                     config.SAFE_STOP_DEFLATE_TIME)
 
     # ============ 状态更新方法 ============
     def _update_init(self, now: float, dt: float, person: bool, hand: str) -> None:
@@ -323,7 +345,9 @@ class StateMachine:
         # 每秒发一次 INFLATE_M, gass += 1(达上限后不再发)
         if self._last_inflate_m_time <= 0.0 or now - self._last_inflate_m_time >= 1.0:
             if self.gass < config.GAS_MAX:
-                self.pump.send_inflate_m()
+                if not self.pump.send_inflate_m():
+                    self._enter_safe_stop()
+                    return
                 self.gass += 1
                 self._last_inflate_m_time = now
                 logger.info("[INFLATING] INFLATE_M, gass=%d/%d",
@@ -334,13 +358,13 @@ class StateMachine:
                 logger.warning("[INFLATING] gass 达上限 %d,锁定充气,后续不再充气",
                                config.GAS_MAX)
                 self._inflate_locked = True
-                self.pump.send_stop_all()
+                self.pump.send_stop_all()  # best-effort
                 self._enter_counting_resume()
                 return
         # 检查是否回到正确动作
         match = ActionRecognizer.check_match(self.target_action, hand)
         if match == MATCH_CORRECT:
-            self.pump.send_stop_all()
+            self.pump.send_stop_all()  # best-effort
             logger.info("[INFLATING] 动作正确,回 COUNTING")
             self._enter_counting_resume()
 
@@ -355,7 +379,7 @@ class StateMachine:
         # 兜底:超时强制放气,防止误检导致 ENDING 死锁
         if now - self._state_enter_time >= config.ENDING_TIMEOUT:
             logger.warning("[ENDING] 超时 %.0f 秒,强制放气", config.ENDING_TIMEOUT)
-            self.pump.send_stop_all()
+            self.pump.send_stop_all()  # best-effort
             self._enter_deflating()
 
     def _update_deflating(self, now: float, dt: float, person: bool, hand: str) -> None:
@@ -363,13 +387,18 @@ class StateMachine:
             self.gass = 0
             self._enter_init()
 
+    def _update_safe_stop(self, now: float, dt: float, person: bool, hand: str) -> None:
+        """SAFE_STOP 态:放气完成后保持等待用户退出,不自动恢复。"""
+        # 不做任何转换,等待用户按 q 退出
+        pass
+
     # ============ 安全机制 ============
     def _trigger_safety(self) -> None:
         """人离开超时或充气超限,触发安全放气序列。
 
         顺序:STOP_ALL → LIGHT_ALL_OFF → DEFLATE_ALL(在 _enter_deflating 中发送)。
         """
-        self.pump.send_stop_all()
+        self.pump.send_stop_all()  # best-effort
         self.light.send_all_off()
         self._enter_deflating()
 
@@ -436,6 +465,11 @@ class StateMachine:
             dur = config.DEFLATE_TIME_B
             remaining = max(0.0, dur - elapsed)
             progress = elapsed / dur if dur > 0 else 0.0
+        elif self.state == STATE_SAFE_STOP:
+            # 显示安全放气进度(放气完成后保持 100%)
+            dur = config.SAFE_STOP_DEFLATE_TIME
+            remaining = max(0.0, dur - elapsed)
+            progress = min(1.0, elapsed / dur) if dur > 0 else 0.0
         # EXTRACTING / ENDING: 不显示计时
 
         # no_person:当前帧无可靠人(主要用于 WAITING 状态可视化区分"等人中")
@@ -467,4 +501,5 @@ class StateMachine:
             STATE_INTERVAL: self._update_interval,
             STATE_ENDING: self._update_ending,
             STATE_DEFLATING: self._update_deflating,
+            STATE_SAFE_STOP: self._update_safe_stop,
         }

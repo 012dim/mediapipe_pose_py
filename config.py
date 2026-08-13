@@ -38,17 +38,15 @@ ACTION_COOLDOWN: float = 1.0           # 同一动作冷却时间(秒),避免重
 MAX_RECENT_ACTIONS: int = 3            # 屏幕底部最多显示的动作数量
 
 
-# ============ 串口配置(可选,默认关闭) ============
+# ============ 串口配置 ============
+# SERIAL_ENABLED=True:严格门禁,3块泵控UNO必须全部连接才进入运行态
+# SERIAL_ENABLED=False:跳过串口(测试用),状态机仍流转,发送静默失败
 SERIAL_ENABLED: bool = False
-SERIAL_BAUDRATE: int = 9600
-SERIAL_TIMEOUT: float = 1.0
-SERIAL_INTERVAL: float = 0.2    # 串口定时发送间隔(秒)
-SERIAL_SEND_NONE: bool = True   # 无动作时是否发送 NONE
-
-# 各平台默认串口名
-DEFAULT_SERIAL_PORT_WIN: str = "COM3"
-DEFAULT_SERIAL_PORT_LINUX: str = "/dev/ttyUSB0"
-DEFAULT_SERIAL_PORT_MAC: str = "/dev/tty.usbserial*"
+SERIAL_BAUDRATE: int = 9600          # 兼容旧代码,实际用 ARDUINO_BAUDRATE
+SERIAL_TIMEOUT: float = 1.0           # 读超时(秒)
+SERIAL_WRITE_TIMEOUT: float = 0.5    # 写超时(秒,防卡死)
+SERIAL_INTERVAL: float = 0.2          # 串口定时发送间隔(秒)
+SERIAL_SEND_NONE: bool = True         # 无动作时是否发送 NONE
 
 
 # ============ Arduino 交互流程配置 ============
@@ -68,12 +66,33 @@ LOOP_INTERVAL: float = 1.0        # INTERVAL 状态间隔秒数
 LOOP_COUNT_MAX: int = 3           # 一轮最多抽取的动作次数
 
 # 充气安全阈值
-GAS_MAX: int = 15                 # INFLATING 累计充气次数上限,达到则强制放气
+GAS_MAX: int = 15                 # INFLATING 累计充气次数上限,达到则锁定充气
 
-# 双 Arduino 串口配置
+# ============ 4 板 Arduino 串口配置 ============
+# 3 块泵控 UNO(PUMP_A/B/C),每块控制 3 个气泵 + 3 个电磁阀 = 6 路
+# 第 4 块为灯箱 UNO(LIGHT),控制 3 个灯泡
+# ★ 端口号必须以实机设备管理器为准 ★
+PUMP_BOARDS: list = [
+    {'id': 'PUMP_A', 'port': 'COM3'},   # 板A:气泵 A1/A2/A3 + 阀 A1/A2/A3
+    {'id': 'PUMP_B', 'port': 'COM5'},   # 板B:气泵 B1/B2/B3 + 阀 B1/B2/B3
+    {'id': 'PUMP_C', 'port': 'COM7'},   # 板C:气泵 C1/C2/C3 + 阀 C1/C2/C3
+]
+LIGHT_SERIAL_PORT: str = "COM4"    # 灯箱 UNO(第 4 块,独立)
 ARDUINO_BAUDRATE: int = 9600
-PUMP_SERIAL_PORT: str = "COM3"    # Uno-A:控制 3 气泵(6 路继电器)
-LIGHT_SERIAL_PORT: str = "COM4"   # Uno-B:控制灯箱 3 灯泡(3 路继电器)
+
+# ============ INFLATE_M 每泵充气时长(毫秒)============
+# 9 泵同步动作,但每泵时长不同(≤1000ms),Python 每秒广播一次 INFLATE_M
+# 每块 UNO 本地硬编码自己的 3 个时长;此处仅供 Python 端记录/可视化
+# ★ 实物标定前为占位值,通电前必须重新确认 ★
+INFLATE_M_MS_PER_BOARD: dict = {
+    'PUMP_A': [300, 500, 800],   # A1, A2, A3
+    'PUMP_B': [400, 600, 700],   # B1, B2, B3
+    'PUMP_C': [500, 700, 900],   # C1, C2, C3
+}
+
+# ============ SAFE_STOP 错误态配置 ============
+# 任一泵控板发送失败时,全组进入 SAFE_STOP:广播 STOP_ALL,等待放气后退出
+SAFE_STOP_DEFLATE_TIME: float = 5.0   # SAFE_STOP 时强制放气秒数
 
 
 def get_default_serial_port() -> str:

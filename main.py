@@ -28,7 +28,7 @@ import config
 from modules.action_recognizer import ActionRecognizer, ActionEvent, HandActionState
 from modules.camera import Camera
 from modules.pose_detector import PoseDetector, PoseResult
-from modules.serial_sender import LightSender, PumpSender
+from modules.serial_sender import LightSender, PumpGroupSender
 from modules.state_machine import StateMachine
 from modules.visualizer import Visualizer
 
@@ -58,8 +58,8 @@ class Application:
             show_skeleton=config.SHOW_SKELETON_DEFAULT,
         )
         self.action_recognizer: ActionRecognizer = ActionRecognizer()
-        # 双 Arduino 串口(气泵 + 灯箱)
-        self.pump_sender: Optional[PumpSender] = None
+        # 4 板 Arduino 串口(3 泵控 PUMP_A/B/C + 1 灯箱)
+        self.pump_group: Optional[PumpGroupSender] = None
         self.light_sender: Optional[LightSender] = None
         self.state_machine: Optional[StateMachine] = None
         self._running: bool = False
@@ -96,30 +96,53 @@ class Application:
         # 截图目录
         os.makedirs(config.SCREENSHOT_DIR, exist_ok=True)
 
-        # 双 Arduino 串口(失败仅警告,状态机仍可运行用于调试)
-        self.pump_sender = PumpSender(
-            port=config.PUMP_SERIAL_PORT,
+        # 4 板 Arduino 串口(3 泵控 PUMP_A/B/C + 1 灯箱)
+        # SERIAL_ENABLED=True:严格门禁,3 块泵控必须全部连接才进入运行态
+        # SERIAL_ENABLED=False:测试模式,串口未连接,状态机仍可流转
+        #   (PumpGroupSender.test_mode=True 时所有 send 跳过并返回成功,
+        #    避免 send 失败触发 SAFE_STOP 导致状态机卡死)
+        self.pump_group = PumpGroupSender(
+            boards_config=config.PUMP_BOARDS,
             baudrate=config.ARDUINO_BAUDRATE,
             timeout=config.SERIAL_TIMEOUT,
+            write_timeout=config.SERIAL_WRITE_TIMEOUT,
+            test_mode=not config.SERIAL_ENABLED,
         )
         self.light_sender = LightSender(
             port=config.LIGHT_SERIAL_PORT,
             baudrate=config.ARDUINO_BAUDRATE,
             timeout=config.SERIAL_TIMEOUT,
+            write_timeout=config.SERIAL_WRITE_TIMEOUT,
         )
-        pump_ok = self.pump_sender.connect()
-        light_ok = self.light_sender.connect()
-        if pump_ok and light_ok:
-            logger.info("双 Arduino 串口已连接: 气泵=%s, 灯箱=%s",
-                        config.PUMP_SERIAL_PORT, config.LIGHT_SERIAL_PORT)
+
+        if config.SERIAL_ENABLED:
+            # 三板门禁:必须 3 块泵控全部连接
+            if not self.pump_group.connect_all():
+                connected = self.pump_group.get_connected_board_ids()
+                missing = [bid for bid in ('PUMP_A', 'PUMP_B', 'PUMP_C')
+                           if bid not in connected]
+                logger.error("泵控板连接失败,缺失: %s;拒绝进入运行态", missing)
+                # 对已连接板 best-effort 发 STOP_ALL 再清理退出
+                self.pump_group.stop_all_best_effort()
+                self._cleanup()
+                return 2
+            if not self.light_sender.connect():
+                logger.error("灯箱串口 %s 连接失败;拒绝进入运行态",
+                             config.LIGHT_SERIAL_PORT)
+                self.pump_group.stop_all_best_effort()
+                self._cleanup()
+                return 2
+            logger.info("4 板 Arduino 串口全部连接: 泵控=%s, 灯箱=%s",
+                        ",".join(b['port'] for b in config.PUMP_BOARDS),
+                        config.LIGHT_SERIAL_PORT)
         else:
+            # 测试模式:不连接串口,状态机仍可运行(发送静默失败)
             logger.warning(
-                "串口未完全连接(气泵=%s, 灯箱=%s),状态机仍可运行但不会真正发送指令",
-                pump_ok, light_ok,
+                "SERIAL_ENABLED=False,测试模式:串口未连接,状态机仍可运行"
             )
 
         # 状态机
-        self.state_machine = StateMachine(self.pump_sender, self.light_sender)
+        self.state_machine = StateMachine(self.pump_group, self.light_sender)
 
         logger.info("启动完成,进入主循环")
         return 0
@@ -288,7 +311,11 @@ class Application:
         self._running = False
 
     def _cleanup(self) -> None:
-        """释放所有资源。"""
+        """释放所有资源。
+
+        顺序:① 摄像头/Pose ② 广播 STOP_ALL + LIGHT_ALL_OFF(安全) ③ 关闭串口
+        必须先发 STOP_ALL 再关串口,确保气泵停止后再断开连接。
+        """
         logger.info("正在释放资源...")
         try:
             self.camera.release()
@@ -299,13 +326,28 @@ class Application:
                 self.pose_detector.close()
         except Exception as e:  # noqa: BLE001
             logger.warning("关闭 PoseDetector 异常: %s", e)
-        # 关闭双 Arduino 串口
-        for name, sender in (("气泵", self.pump_sender), ("灯箱", self.light_sender)):
-            if sender is not None:
-                try:
-                    sender.close()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("关闭%s串口异常: %s", name, e)
+        # 安全:先广播 STOP_ALL 和 LIGHT_ALL_OFF,再关闭串口
+        if self.pump_group is not None:
+            try:
+                self.pump_group.stop_all_best_effort()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("STOP_ALL 异常: %s", e)
+        if self.light_sender is not None:
+            try:
+                self.light_sender.send_all_off()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("LIGHT_ALL_OFF 异常: %s", e)
+        # 关闭串口
+        if self.pump_group is not None:
+            try:
+                self.pump_group.close_all()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("关闭泵组串口异常: %s", e)
+        if self.light_sender is not None:
+            try:
+                self.light_sender.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("关闭灯箱串口异常: %s", e)
         try:
             cv2.destroyAllWindows()
         except Exception:  # noqa: BLE001
