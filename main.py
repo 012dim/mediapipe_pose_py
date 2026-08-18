@@ -7,7 +7,7 @@
 1. 摄像头采集 + 水平翻转
 2. MediaPipe Pose 推理(33 关键点)
 3. 动作识别(手部 3 种)+ 冷却
-4. 状态机推进(8 状态 Arduino 交互流程)
+4. 状态机推进(9 状态含 SAFE_STOP 的 Arduino 交互流程)
 5. 可视化(骨骼 + FPS + 状态面板)
 6. 键盘交互(q/s/f/c/r)
 
@@ -288,20 +288,27 @@ class Application:
             logger.warning("截图保存失败: %s", filepath)
 
     def _switch_camera(self) -> None:
-        """切换到下一个摄像头 ID(0 -> 1 -> 2 -> 0)。"""
+        """切换到下一个摄像头 ID(报告 7.3:失败时显式切回旧 ID)。
+
+        旧版失败时只调 self.camera.open(),但此时 camera_id 已被 switch()
+        改成失败的新 ID,等于再次打开失败设备。新版先保存 old_id,
+        失败后显式 switch(old_id) 切回仍在工作的旧摄像头。
+        """
         ids = config.AVAILABLE_CAMERA_IDS
         if not ids:
             logger.warning("未配置 AVAILABLE_CAMERA_IDS")
             return
+        old_id = self.camera.camera_id
         try:
-            idx = ids.index(self.camera.camera_id)
+            idx = ids.index(old_id)
         except ValueError:
             idx = -1
         new_id = ids[(idx + 1) % len(ids)]
-        if not self.camera.switch(new_id):
-            logger.warning("切换到摄像头 %d 失败,切回原摄像头", new_id)
-            # 尝试切回原摄像头
-            self.camera.open()
+        if self.camera.switch(new_id):
+            return
+        logger.warning("切换到摄像头 %d 失败,尝试恢复摄像头 %d", new_id, old_id)
+        if not self.camera.switch(old_id):
+            logger.error("恢复摄像头 %d 也失败", old_id)
 
     def _log_state_change(self, state: HandActionState) -> None:
         """仅在手部动作状态变化时打印日志,避免每帧刷屏。

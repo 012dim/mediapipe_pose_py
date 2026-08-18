@@ -249,6 +249,53 @@ class SerialSender:
         logger.warning("串口 %s 等待 ACK 超时", self.port)
         return False
 
+    def _parse_response_line(
+        self,
+        text: str,
+        expected_board_id: str,
+        accepted_commands: Set[str],
+    ) -> Optional[bool]:
+        """解析单行响应文本(报告 7.2)。
+
+        将 ACK/ERR 解析逻辑抽出,供公平轮询复用。与 _read_ack 中内联逻辑等价。
+
+        Returns:
+            True=正确 ACK;False=明确 ERR/板号错;None=旧 ACK/READY/STATUS/无关消息。
+        """
+        parts = text.split(",")
+        if len(parts) < 2:
+            return None
+        msg_type = parts[0]
+        board = parts[1]
+
+        if msg_type == "ACK":
+            if expected_board_id and board != expected_board_id:
+                logger.warning(
+                    "串口 %s ACK 板号不匹配:期望 %s,收到 %s",
+                    self.port, expected_board_id, board,
+                )
+                return False
+            cmd = parts[2] if len(parts) > 2 else ""
+            if cmd not in accepted_commands:
+                logger.warning(
+                    "串口 %s 跳过旧 ACK: %s(当前等待: %s)",
+                    self.port, cmd, accepted_commands,
+                )
+                return None
+            return True
+        elif msg_type == "ERR":
+            reason = parts[2] if len(parts) > 2 else "UNKNOWN"
+            logger.warning(
+                "串口 %s 收到 ERR: %s,%s",
+                self.port, board, reason,
+            )
+            return False
+        elif msg_type in ("READY", "STATUS"):
+            return None
+        else:
+            logger.debug("串口 %s 收到未知响应: %s", self.port, text)
+            return None
+
     def send(self, message: str) -> bool:
         """只写入一行文本到串口,不等待响应(best-effort 场景)。
 
@@ -508,15 +555,17 @@ class PumpGroupSender:
         accepted_commands: Set[str],
         response_timeout: float = 0.8,
     ) -> dict:
-        """先向 3 板写入命令,再统一收集 ACK/ERR(不串行等待)。
+        """先向 3 板写入命令,再公平轮询收集 ACK/ERR(报告 7.2/6.3)。
 
-        报告 6.3:为了保持 3 板同步,先连续写入,再在统一超时内收集。
-        不采用"等待 A 完整回复后才给 B 发送"的串行结构。
+        报告 7.2:旧版按 A→B→C 顺序逐板 _read_ack,无响应的 A 会占满共享
+        deadline,导致已回复的 B/C 也被误判失败。新版在共享 deadline 内
+        循环检查每板串口的 in_waiting,每次只处理一行,实现公平轮询:
+        无响应的板不再阻塞已回复的板。
 
         Args:
             command: 命令文本(不含换行符)。
             accepted_commands: 接受的命令集合。
-            response_timeout: 每板响应超时秒数。
+            response_timeout: 共享响应超时秒数(三板总等待上限)。
 
         Returns:
             dict[板ID, bool]: 每板发送+ACK 结果。
@@ -530,29 +579,51 @@ class PumpGroupSender:
         for board_id in self.board_ids:
             sender = self.boards[board_id]
             ok = sender._write(command)
-            if not ok:
-                results[board_id] = False
-            else:
-                results[board_id] = None  # 待收集
+            results[board_id] = True if ok else False
 
-        # 2. 再逐板收集 ACK/ERR(报告 7.3:共享截止时间)
-        #    所有板使用同一个 deadline,三板总等待时间 = response_timeout,
-        #    而不是每板各占满 response_timeout(最差 3×0.8s)。
+        # 2. 公平轮询收集(报告 7.2)
+        #    pending 集合只含写入成功的板;每轮检查各板 in_waiting,
+        #    有数据才 readline,无数据跳过让其他板有机会被读。
+        pending = {bid for bid in self.board_ids if results[bid] is True}
         deadline = time.monotonic() + response_timeout
-        for board_id in self.board_ids:
-            if results[board_id] is not None:
-                continue  # 写入已失败,跳过
-            remaining = max(0.0, deadline - time.monotonic())
-            if remaining <= 0.0:
-                results[board_id] = False
-                logger.warning("[PUMP_GROUP] %s <- %s : 超时(共享 deadline 已过)",
-                               board_id, command)
-                continue
-            sender = self.boards[board_id]
-            ok = sender._read_ack(board_id, accepted_commands, remaining)
-            results[board_id] = ok
-            logger.info("[PUMP_GROUP] %s <- %s : %s",
-                        board_id, command, "OK" if ok else "FAIL")
+
+        while pending and time.monotonic() < deadline:
+            progressed = False
+            for board_id in tuple(pending):
+                sender = self.boards[board_id]
+                conn = sender.serial_conn
+                if conn is None:
+                    pending.discard(board_id)
+                    results[board_id] = False
+                    continue
+
+                in_waiting = getattr(conn, "in_waiting", 0)
+                if not in_waiting:
+                    continue  # 该板暂无数据,跳过让其他板有机会被读
+
+                line = conn.readline()
+                progressed = True
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                parsed = sender._parse_response_line(
+                    text, board_id, accepted_commands,
+                )
+                if parsed is None:
+                    continue  # 旧 ACK / READY / STATUS / 无关消息,继续等
+                results[board_id] = parsed
+                pending.discard(board_id)
+                logger.info("[PUMP_GROUP] %s <- %s : %s",
+                            board_id, command, "OK" if parsed else "FAIL")
+
+            if not progressed:
+                time.sleep(0.005)  # 三板都无数据时让出 CPU,避免忙等
+
+        # 3. 共享 deadline 已过仍未回复的板标记失败
+        for board_id in pending:
+            results[board_id] = False
+            logger.warning("[PUMP_GROUP] %s <- %s : 超时(共享 deadline 已过)",
+                           board_id, command)
         return results
 
     def _check_all_ok(self, results: dict) -> bool:

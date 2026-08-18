@@ -50,6 +50,9 @@ class Camera:
         try:
             self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_DSHOW)
             if not self.cap.isOpened():
+                # 报告 7.3:先 release() 失败的 VideoCapture 避免资源泄漏
+                # (旧版直接覆盖 self.cap,失败的实例未释放会占用底层设备句柄)
+                self.cap.release()
                 # 退回默认 API 再试一次(部分系统不支持 CAP_DSHOW)
                 self.cap = cv2.VideoCapture(self.camera_id)
                 if not self.cap.isOpened():

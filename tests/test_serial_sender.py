@@ -65,6 +65,15 @@ class FakeSerial:
         self._input_buffer += text
 
     @property
+    def in_waiting(self) -> int:
+        """返回输入缓冲区可读字节数(模拟 pyserial Serial.in_waiting)。
+
+        报告 7.2:公平轮询依赖该属性判断某板是否有数据可读,
+        避免无响应的板阻塞已回复的板。
+        """
+        return len(self._input_buffer.encode("utf-8"))
+
+    @property
     def written_texts(self) -> list:
         """已写入的文本列表(解码)。"""
         result = []
@@ -472,18 +481,18 @@ class TestStaleAckTiming:
     def test_stop_all_partial_failure_no_recursive_retry(self) -> None:
         """STOP_ALL 部分板失败:不递归重发,返回 False 但不抛异常。
 
-        共享 deadline 语义(报告 7.3 第三步):PUMP_B 无响应会耗尽
-        0.8 秒总时间,PUMP_C 即使正常也来不及读 ACK 而被标记为失败;
-        这保证"三板总等待时间 = response_timeout",不会拖到 3×0.8 秒。
+        报告 7.2 公平轮询语义:PUMP_B 无响应时,A/C 的 ACK 仍能在
+        共享 deadline 内被读到(旧版顺序读取会让 B 占满 0.8s 导致
+        C 被误判失败)。B 超时标记失败,但不影响 A/C。
         """
         group = make_auto_ack_group()
         # PUMP_B 不回 ACK(替换为普通 FakeSerial,不自动回)
         group.boards["PUMP_B"].serial_conn = FakeSerial()
 
         results = group.stop_all_best_effort()
-        assert results["PUMP_A"] is True    # 先读,B 超时前已成功
-        assert results["PUMP_B"] is False   # 无响应,耗尽共享时间
-        assert results["PUMP_C"] is False   # 共享 deadline 已过,来不及读
+        assert results["PUMP_A"] is True    # 公平轮询:B 阻塞前已读成功
+        assert results["PUMP_B"] is False   # 无响应,共享 deadline 后标记失败
+        assert results["PUMP_C"] is True    # 报告 7.2:B 不再阻塞 C
         assert group.send_stop_all() is False
 
     def test_light_flash_stale_ack_not_pollute_next(self) -> None:
@@ -496,6 +505,72 @@ class TestStaleAckTiming:
         assert light.send_all_off() is True
         # 且不应有残留
         assert light.serial_conn.readline() == b""
+
+
+# ============ 公平 ACK 收集测试(报告 7.2) ============
+
+class TestFairAckCollection:
+    """报告 7.2:PUMP_A 无响应时 B/C 仍能在共享 deadline 内被读到 ACK。
+
+    旧版顺序读取(A→B→C)会让无响应的 A 占满 0.8s 共享 deadline,
+    导致已回复的 B/C 也被误判失败;新版使用公平轮询解决该边界问题。
+    """
+
+    def test_a_no_response_bc_succeed_within_deadline(self) -> None:
+        """A 无响应、B/C 在 50ms 内返回 ACK → 结果 A=False, B/C=True。"""
+        group = make_auto_ack_group()
+        # PUMP_A 替换为不自动回 ACK 的 FakeSerial
+        group.boards["PUMP_A"].serial_conn = FakeSerial()
+
+        results = group._send_all_and_collect(
+            "STOP_ALL",
+            accepted_commands={"STOP_ALL"},
+            response_timeout=0.8,
+        )
+        assert results["PUMP_A"] is False
+        assert results["PUMP_B"] is True
+        assert results["PUMP_C"] is True
+
+    def test_all_respond_success(self) -> None:
+        """三板均自动 ACK → 全部成功,无超时。"""
+        group = make_auto_ack_group()
+
+        results = group._send_all_and_collect(
+            "INFLATE_M",
+            accepted_commands={"INFLATE_M", "INFLATE_M_REFRESH"},
+            response_timeout=0.8,
+        )
+        assert results == {"PUMP_A": True, "PUMP_B": True, "PUMP_C": True}
+
+    def test_one_err_marks_only_that_board_failed(self) -> None:
+        """B 返回 ERR → 仅 B=False,A/C 仍为 True。"""
+        group = make_auto_ack_group()
+        # PUMP_B 预填一个 ERR 响应
+        group.boards["PUMP_B"].serial_conn = FakeSerial()
+        group.boards["PUMP_B"].serial_conn.feed("ERR,PUMP_B,BAD_ARGS\n")
+
+        results = group._send_all_and_collect(
+            "INFLATE_ALL,5.0",
+            accepted_commands={"INFLATE_ALL"},
+            response_timeout=0.8,
+        )
+        assert results["PUMP_A"] is True
+        assert results["PUMP_B"] is False
+        assert results["PUMP_C"] is True
+
+    def test_bc_ack_not_left_in_buffer_after_a_timeout(self) -> None:
+        """报告 7.2 验收点:B/C 的 ACK 不应遗留缓冲区(被本轮消费干净)。"""
+        group = make_auto_ack_group()
+        group.boards["PUMP_A"].serial_conn = FakeSerial()
+
+        group._send_all_and_collect(
+            "STOP_ALL",
+            accepted_commands={"STOP_ALL"},
+            response_timeout=0.3,
+        )
+        # B/C 的 ACK 应已被本轮消费,readline 应返回 b""
+        assert group.boards["PUMP_B"].serial_conn.readline() == b""
+        assert group.boards["PUMP_C"].serial_conn.readline() == b""
 
 
 # ============ READY 点充时长校验测试(报告 10.3) ============

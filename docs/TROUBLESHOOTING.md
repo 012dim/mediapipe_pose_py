@@ -169,7 +169,9 @@ pip install protobuf==3.20.3 --force-reinstall
 1. 确认 3 块 UNO 已通过 USB 连接
 2. 确认每块 UNO 烧录了正确的 `BOARD_ID`(PUMP_A / PUMP_B / PUMP_C)
 3. 确认 COM 口与 `config.py` 的 `PUMP_BOARDS` 一致
-4. 检查日志中是否收到 `READY,<板号>` 响应;若板号不匹配会拒绝连接
+4. 检查日志中是否收到 `READY,<板号>,<时长1>,<时长2>,<时长3>` 响应(5 字段);
+   若板号不匹配或三路时长与 `config.INFLATE_M_MS_PER_BOARD` 不一致会拒绝连接
+   (报告 10.2:此门禁拦截"PUMP_B 烧了 PUMP_A 参数"或"改配置未重烧"错误)
 
 ### Q16:Arduino 收不到数据
 
@@ -254,9 +256,11 @@ cv2.destroyAllWindows()
 
 发送: TEST_PUMP,0,1
 返回: ACK,PUMP_A,TEST_PUMP
-(1秒后)
-返回: READY,PUMP_A   (测试完成)
 ```
+
+> 注意:READY 只在上电 `setup()` 阶段发送一次,格式为
+> `READY,PUMP_A,300,500,800`(5 字段:板号 + 三路点充时长)。
+> 测试指令成功返回的是 `ACK,<板号>,<命令>`,不会再返回 READY。
 
 ### 性能分析
 

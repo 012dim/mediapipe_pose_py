@@ -97,7 +97,7 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 包含 3 个类:
 
 **`PumpSender`(继承 SerialSender)**:单块泵控 UNO 串口
-- `connect(expected_board_id, ready_timeout)`:打开串口并读取 READY 校验板号
+- `connect(expected_board_id, ready_timeout, expected_ready_params)`:打开串口并读取 READY,校验板号与三路点充时长(报告 10.2:`expected_ready_params` 非 None 时,READY 必须携带 5 字段且三路时长与 Python 配置完全相等,否则拒绝连接)
 - `send_and_wait(message, expected_board_id, accepted_commands, response_timeout)`:发送命令并等待 ACK/ERR
 - `send_inflate_all(seconds)` / `send_deflate_all(seconds)` / `send_inflate_m()` / `send_stop_all()`
 
@@ -106,7 +106,7 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 - `light_id_for_action(action_name)`:动作 → 灯号映射
 
 **`PumpGroupSender`**:泵组发送器,管理 3 块泵控 UNO
-- `connect_all()`:连接 3 板并校验板号(任一失败返回 False)
+- `connect_all(expected_inflate_m_ms)`:连接 3 板并校验板号 + 三路点充时长(任一失败返回 False;`expected_inflate_m_ms` 来自 `config.INFLATE_M_MS_PER_BOARD`,逐板传入对应三路时长做 READY 严格比对)
 - `send_inflate_all(seconds)` / `send_deflate_all(seconds)` / `send_inflate_m()`:三板广播,任一板失败 → `stop_all_best_effort()` + 返回 False(状态机进 SAFE_STOP)
 - `send_stop_all()`:best-effort 广播 STOP_ALL(不进 SAFE_STOP,避免递归)
 - `send_deflate_all_best_effort(seconds)`:仅供 SAFE_STOP 使用,部分失败不再 STOP_ALL(避免取消正常板放气)

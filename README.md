@@ -161,10 +161,12 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 
 | 响应 | 含义 |
 |------|------|
-| `READY,<板号>` | 上电就绪 |
+| `READY,<板号>,<时长1>,<时长2>,<时长3>` | 上电就绪(5 字段:板号 + 本板三路 INFLATE_M_MS_PER_PUMP,用于与 `config.INFLATE_M_MS_PER_BOARD` 严格比对,不一致拒绝连接) |
 | `ACK,<板号>,<命令>` | 指令执行成功(如 `ACK,PUMP_A,INFLATE_ALL`) |
 | `ERR,<板号>,<原因>` | 指令拒绝/失败(原因:`BAD_DURATION` / `BAD_PUMP_INDEX` / `BAD_TEST_DURATION` / `BAD_ARGS` / `UNKNOWN_CMD`) |
 | `STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx` | 状态查询响应(mode ∈ IDLE/INFLATE_ALL/DEFLATE_ALL/INFLATE_M/TEST;relay/servo 为 6 位 0/1 位图,设备 0..5) |
+
+> **READY 严格门禁(报告 10.2)**:`SERIAL_ENABLED=True` 时,`connect(expected_ready_params=config.INFLATE_M_MS_PER_BOARD[板号])` 会要求 Arduino 上电 READY 携带 5 字段,且三路时长与 Python 配置**完全相等**,否则拒绝进入运行态。此举拦截"PUMP_B 烧了 PUMP_A 参数"或"改了配置未重烧 Arduino"两类常见部署错误。灯箱 READY 仍为 2 字段(`READY,LIGHT`)。
 
 **灯箱 (LIGHT, COM4)**:
 
@@ -185,14 +187,15 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 
 - [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino) — **★ 当前版本(v4.2)** 3 块泵控 UNO 共用源码。基于 RC 脉冲 + 继电器供电隔离模型,扩展至 3 泵 + 3 阀 = 6 设备。烧录前修改顶部 `BOARD_ID` 为 `PUMP_A` / `PUMP_B` / `PUMP_C`,以及 `INFLATE_M_MS_PER_PUMP[3]`(每泵吸气时长,实物标定后修改)
 - [pump_uno_commands.txt](arduino_commands/pump_uno_commands.txt) — **(旧版 v4.1,已废弃)** 单板单泵控继电器模型参考代码。仅供历史对照,新项目请使用 `pump_uno_v4_2.ino`
-- [lightbox_uno_commands.txt](arduino_commands/lightbox_uno_commands.txt) — 灯箱 UNO 代码,顶部可调引脚、触发电平、闪烁时长
+- [lightbox_uno_v4_2/lightbox_uno_v4_2.ino](arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino) — **★ 当前版本(v4.2.1)** 灯箱 UNO 独立可编译 sketch,非阻塞闪烁状态机(报告 7.1)。可直接用 Arduino IDE 打开上传,无需从 .txt 复制粘贴
+- [lightbox_uno_commands.txt](arduino_commands/lightbox_uno_commands.txt) — 灯箱 UNO 说明文档(接线/协议/参数),固件代码已拆到上述 .ino
 
 烧录步骤:
 
 1. 用 Arduino IDE 打开 `pump_uno_v4_2.ino`,修改顶部 `BOARD_ID` 为 `PUMP_A`
 2. 修改 `INFLATE_M_MS_PER_PUMP[3]` 为本板 3 个泵的实测吸气时长(毫秒,≤ 1000)
 3. 上传至第 1 块 UNO;重复步骤 1-3,改 `BOARD_ID` 为 `PUMP_B` / `PUMP_C` 后分别上传至第 2、3 块 UNO
-4. 打开 `lightbox_uno_commands.txt` 中的代码,上传至第 4 块 UNO(灯箱)
+4. 用 Arduino IDE 打开 `arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino`,上传至第 4 块 UNO(灯箱);`lightbox_uno_commands.txt` 仅供接线/参数说明参考,无需复制代码
 5. 在 Windows 设备管理器中确认 4 个 COM 口编号,更新 [config.py](config.py) 的 `PUMP_BOARDS` 与 `LIGHT_SERIAL_PORT`
 
 ## 33 个关键点编号对照表
@@ -303,7 +306,9 @@ mediapipe_pose_py/
 ├── arduino_commands/           # Arduino 参考代码(不被 Python 执行)
 │   ├── pump_uno_v4_2.ino       # ★ v4.2 泵控 UNO 源码(3 板共用,改 BOARD_ID)
 │   ├── pump_uno_commands.txt   # (旧版 v4.1,已废弃)单板泵控参考
-│   └── lightbox_uno_commands.txt # 灯箱 UNO 代码(含详细注释)
+│   ├── lightbox_uno_v4_2/      # ★ v4.2.1 灯箱 UNO 独立 sketch 目录
+│   │   └── lightbox_uno_v4_2.ino # 非阻塞闪烁固件(可直接编译上传)
+│   └── lightbox_uno_commands.txt # 灯箱 UNO 说明文档(接线/协议/参数)
 ├── models/                     # 占位(MediaPipe 用内置模型)
 ├── screenshots/                # 截图保存目录
 └── docs/

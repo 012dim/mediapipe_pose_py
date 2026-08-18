@@ -77,8 +77,10 @@ ARDUINO_BAUDRATE: int = 9600
 
 # ============ INFLATE_M 每泵充气时长(毫秒)============
 # 9 泵同步动作,但每泵时长不同(≤1000ms),Python 每秒广播一次 INFLATE_M
-# 每块 UNO 本地硬编码自己的 3 个时长;此处仅供 Python 端记录/可视化
-# ★ 实物标定前为占位值,通电前必须重新确认 ★
+# 每块 UNO 本地硬编码自己的 3 个时长;此处正式模式下作为 READY 启动门禁
+# (connect(expected_ready_params=...) 会与 Arduino 上电 READY 中的三路时长严格比对,
+#  不一致即拒绝进入运行态,拦截"PUMP_B 烧了 PUMP_A 参数"或"改配置未重烧"错误)
+# ★ 实物标定前为占位值,通电前必须重新确认且与 Arduino 固件完全一致 ★
 INFLATE_M_MS_PER_BOARD: dict = {
     'PUMP_A': [300, 500, 800],   # A1, A2, A3
     'PUMP_B': [400, 600, 700],   # B1, B2, B3
