@@ -27,7 +27,9 @@
  *   TEST_PUMP,i,t    测试第 i 号泵(0..2),持续 t 秒(0 < t <= 5)
  *
  * 响应(每条指令执行后回送):
- *   READY,<板号>                       上电就绪
+ *   READY,<板号>,<泵1时长>,<泵2时长>,<泵3时长>
+ *                       上电就绪(同时回送本板 3 泵点充时长,单位 ms,
+ *                       用于 Python 端核对烧录参数是否与标定表一致)
  *   ACK,<板号>,<命令>                  指令执行成功
  *   ERR,<板号>,<原因>                  指令拒绝/失败
  *   STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx
@@ -409,8 +411,15 @@ void setup() {
     digitalWrite(RELAY_PINS[i], RELAY_ACTIVE_LOW ? HIGH : LOW);
   }
   allOff();  // 清除所有运行时标志(双重保险)
+  // 上电就绪:回送本板 ID + 3 泵点充时长(用于 Python 端核对烧录参数)
+  // 格式: READY,<板号>,<泵1时长>,<泵2时长>,<泵3时长>  (单位 ms)
   Serial.print("READY,");
-  Serial.println(BOARD_ID);
+  Serial.print(BOARD_ID);
+  for (int i = 0; i < CHANNEL_COUNT; i++) {
+    Serial.print(",");
+    Serial.print(INFLATE_M_MS_PER_PUMP[i]);
+  }
+  Serial.println();
 }
 
 /**

@@ -29,6 +29,11 @@ RIGHT_WRIST = 16
 # 无动作状态名
 HAND_NONE = "HAND_NONE"
 
+# 手部动作名(3 种,与 HAND_NONE 一致使用模块级常量,便于外部导入与去重)
+LEFT_HAND_UP = "LEFT_HAND_UP"
+RIGHT_HAND_UP = "RIGHT_HAND_UP"
+BOTH_HANDS_UP = "BOTH_HANDS_UP"
+
 # 动作匹配结果(用于状态机判定 COUNTING 阶段动作正确性)
 MATCH_CORRECT = "MATCH_CORRECT"     # 当前动作 == 目标动作
 MATCH_WRONG = "MATCH_WRONG"         # 当前动作 != 目标 且 != HAND_NONE

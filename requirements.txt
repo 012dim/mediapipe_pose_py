@@ -1,16 +1,21 @@
 # MediaPipe Pose 动作识别项目依赖
 # Python 3.10 / 3.11 / 3.12 均可安装
 
-# 核心库
-mediapipe>=0.10.14,<0.11
-opencv-python>=4.8.0,<4.10
-numpy>=1.24.0,<2.0
+# MediaPipe 旧版 Solutions 接口;当前代码依赖 mp.solutions.pose
+# 0.10.21 之后的版本不再提供 mp.solutions,必须固定
+mediapipe==0.10.21
 
-# 可选:串口通信(给 Arduino 用)
-pyserial>=3.5,<4.0
+# MediaPipe 0.10.21 依赖 contrib 版本,不要同时安装 opencv-python
+# 否则两者会共同占用 cv2 命名空间导致冲突
+opencv-contrib-python==4.9.0.80
+
+numpy==1.26.4
+
+# 串口通信(Arduino 控制)
+pyserial==3.5
 
 # 中文渲染(visualizer 用 PIL 绘制中文)
-Pillow>=10.0.0,<11.0
+Pillow==10.4.0
 
 # 测试
-pytest>=7.4.0,<9.0
+pytest==8.4.2

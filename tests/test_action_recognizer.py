@@ -1,12 +1,19 @@
-"""action_recognizer 单元测试。
+"""action_recognizer 单元测试(v4.2 — 仅 3 种手部动作)。
 
-使用 mock 的 PoseResult / LandmarkPoint 验证 6 种动作识别 + 冷却逻辑。
+镜像约定(必须与软件实测一致):
+- 主循环执行 cv2.flip(frame, 1) 水平翻转画面
+- 识别代码交换 LEFT_WRIST / RIGHT_WRIST 判定:
+    left_up  = _is_hand_up(lm[RIGHT_WRIST], lm[NOSE])  # 用户左手 = MediaPipe RIGHT_WRIST
+    right_up = _is_hand_up(lm[LEFT_WRIST],  lm[NOSE])  # 用户右手 = MediaPipe LEFT_WRIST
+
+因此测试数据构造:
+- 测试 LEFT_HAND_UP  → 让 lm[RIGHT_WRIST] 高于鼻子
+- 测试 RIGHT_HAND_UP → 让 lm[LEFT_WRIST]  高于鼻子
+- 测试 BOTH_HANDS_UP → 两个手腕都高于鼻子
 
 运行:
     pytest tests/test_action_recognizer.py -v
 """
-import time
-
 import pytest
 
 from modules.action_recognizer import (
@@ -17,68 +24,53 @@ from modules.action_recognizer import (
     NOSE,
     LEFT_SHOULDER,
     RIGHT_SHOULDER,
-    LEFT_HIP,
-    RIGHT_HIP,
-    LEFT_KNEE,
-    RIGHT_KNEE,
-    LEFT_ANKLE,
-    RIGHT_ANKLE,
+    HAND_NONE,
+    MATCH_CORRECT,
+    MATCH_WRONG,
 )
 from modules.pose_detector import LandmarkPoint, PoseResult
 
 
+# ---------- 测试数据构造工具 ----------
+
 def make_landmark(x: float, y: float, z: float = 0.0, v: float = 1.0) -> LandmarkPoint:
-    """构造一个 LandmarkPoint。
-
-    Args:
-        x: 归一化横坐标。
-        y: 归一化纵坐标。
-        z: 深度。
-        v: 可见度。
-
-    Returns:
-        LandmarkPoint 实例。
-    """
+    """构造一个 LandmarkPoint。"""
     return LandmarkPoint(x=x, y=y, z=z, visibility=v)
 
 
 def make_landmarks(**overrides) -> list:
-    """构造 33 个关键点,默认站立姿态。
+    """构造 33 个关键点,默认双手下垂姿态。
 
-    可通过 overrides 覆盖指定关键点:make_landmarks(left_wrist=lm, nose=lm)
+    可通过 overrides 覆盖指定关键点:
+        make_landmarks(left_wrist=lm, nose=lm)
 
-    Returns:
-        List[LandmarkPoint]: 33 个关键点。
+    注意:本函数参数名 left_wrist / right_wrist 指 MediaPipe 关键点索引
+    (LEFT_WRIST=15, RIGHT_WRIST=16),不是用户的左右手。
     """
-    # 关键点中文名 -> 索引
     name_to_idx = {
         "nose": NOSE,
-        "left_shoulder": LEFT_SHOULDER, "right_shoulder": RIGHT_SHOULDER,
-        "left_elbow": 13, "right_elbow": 14,
-        "left_wrist": LEFT_WRIST, "right_wrist": RIGHT_WRIST,
-        "left_hip": LEFT_HIP, "right_hip": RIGHT_HIP,
-        "left_knee": LEFT_KNEE, "right_knee": RIGHT_KNEE,
-        "left_ankle": LEFT_ANKLE, "right_ankle": RIGHT_ANKLE,
+        "left_shoulder": LEFT_SHOULDER,
+        "right_shoulder": RIGHT_SHOULDER,
+        "left_elbow": 13,
+        "right_elbow": 14,
+        "left_wrist": LEFT_WRIST,
+        "right_wrist": RIGHT_WRIST,
     }
-    # 默认站立姿态(垂直,膝伸直)
+    # 默认姿态:鼻子在上方,双手自然下垂
     defaults = {
         "nose": (0.50, 0.10),
-        "left_shoulder": (0.40, 0.25), "right_shoulder": (0.60, 0.25),
-        "left_elbow": (0.38, 0.40), "right_elbow": (0.62, 0.40),
-        "left_wrist": (0.36, 0.55), "right_wrist": (0.64, 0.55),
-        "left_hip": (0.43, 0.55), "right_hip": (0.57, 0.55),
-        "left_knee": (0.43, 0.75), "right_knee": (0.57, 0.75),
-        "left_ankle": (0.43, 0.95), "right_ankle": (0.57, 0.95),
+        "left_shoulder": (0.40, 0.25),
+        "right_shoulder": (0.60, 0.25),
+        "left_elbow": (0.38, 0.40),
+        "right_elbow": (0.62, 0.40),
+        "left_wrist": (0.36, 0.55),
+        "right_wrist": (0.64, 0.55),
     }
-    points = []
-    for i in range(33):
-        points.append(make_landmark(0.5, 0.5))
+    points = [make_landmark(0.5, 0.5) for _ in range(33)]
     for name, (x, y) in defaults.items():
-        idx = name_to_idx[name]
-        points[idx] = make_landmark(x, y)
+        points[name_to_idx[name]] = make_landmark(x, y)
     for name, pt in overrides.items():
-        idx = name_to_idx[name]
-        points[idx] = pt
+        points[name_to_idx[name]] = pt
     return points
 
 
@@ -92,153 +84,131 @@ def make_empty_pose() -> PoseResult:
     return PoseResult(landmarks=None, raw_landmarks=None, person_detected=False)
 
 
-class TestHandUp:
-    """举手类动作测试。"""
+# ---------- 1~4:手部动作判定 ----------
+
+class TestHandActionDetection:
+    """手部动作判定测试(使用 recognize_current,不受冷却影响)。"""
 
     def test_left_hand_up(self) -> None:
-        """左手腕高于鼻子 0.05 触发 LEFT_HAND_UP。"""
+        """用户左手举起 → LEFT_HAND_UP。
+
+        镜像约定:用户左手 = MediaPipe RIGHT_WRIST。
+        让 lm[RIGHT_WRIST] 高于鼻子 → 触发 LEFT_HAND_UP。
+        """
         rec = ActionRecognizer()
-        # 鼻子 y=0.10,阈值 0.05,左手腕 y < 0.05
-        lw = make_landmark(0.36, 0.03)
-        rw = make_landmark(0.64, 0.55)  # 右手未举起
-        lm = make_landmarks(left_wrist=lw, right_wrist=rw)
-        event = rec.recognize(make_pose(lm))
-        assert event is not None
-        assert event.name == "LEFT_HAND_UP"
+        # 鼻子 y=0.10,阈值默认 0.05,手腕 y < 0.05
+        rw_up = make_landmark(0.64, 0.03)  # MediaPipe RIGHT_WRIST 高
+        lw_down = make_landmark(0.36, 0.55)  # MediaPipe LEFT_WRIST 低
+        lm = make_landmarks(left_wrist=lw_down, right_wrist=rw_up)
+        state = rec.recognize_current(make_pose(lm))
+        assert state.hand_action == "LEFT_HAND_UP"
 
     def test_right_hand_up(self) -> None:
-        """右手腕高于鼻子 0.05 触发 RIGHT_HAND_UP。"""
+        """用户右手举起 → RIGHT_HAND_UP。
+
+        镜像约定:用户右手 = MediaPipe LEFT_WRIST。
+        让 lm[LEFT_WRIST] 高于鼻子 → 触发 RIGHT_HAND_UP。
+        """
         rec = ActionRecognizer()
-        lw = make_landmark(0.36, 0.55)
-        rw = make_landmark(0.64, 0.03)
-        lm = make_landmarks(left_wrist=lw, right_wrist=rw)
-        event = rec.recognize(make_pose(lm))
-        assert event is not None
-        assert event.name == "RIGHT_HAND_UP"
+        lw_up = make_landmark(0.36, 0.03)  # MediaPipe LEFT_WRIST 高
+        rw_down = make_landmark(0.64, 0.55)  # MediaPipe RIGHT_WRIST 低
+        lm = make_landmarks(left_wrist=lw_up, right_wrist=rw_down)
+        state = rec.recognize_current(make_pose(lm))
+        assert state.hand_action == "RIGHT_HAND_UP"
 
     def test_both_hands_up(self) -> None:
-        """双手都举起触发 BOTH_HANDS_UP(而非 LEFT/RIGHT)。"""
+        """双手都举起 → BOTH_HANDS_UP(而非 LEFT/RIGHT)。"""
         rec = ActionRecognizer()
-        lw = make_landmark(0.36, 0.03)
-        rw = make_landmark(0.64, 0.03)
-        lm = make_landmarks(left_wrist=lw, right_wrist=rw)
-        event = rec.recognize(make_pose(lm))
-        assert event is not None
-        assert event.name == "BOTH_HANDS_UP"
+        lw_up = make_landmark(0.36, 0.03)
+        rw_up = make_landmark(0.64, 0.03)
+        lm = make_landmarks(left_wrist=lw_up, right_wrist=rw_up)
+        state = rec.recognize_current(make_pose(lm))
+        assert state.hand_action == "BOTH_HANDS_UP"
 
     def test_no_hand_up(self) -> None:
-        """双手自然下垂时不应触发举手。"""
+        """双手自然下垂 → HAND_NONE。"""
         rec = ActionRecognizer()
-        # 默认手腕 y=0.55, 鼻子 y=0.10, 0.55 > 0.05,不举手
+        # 默认姿态:手腕 y=0.55,鼻子 y=0.10,0.55 > 0.05,不举手
         lm = make_landmarks()
-        event = rec.recognize(make_pose(lm))
-        # 站姿默认应触发 STAND 而非举手
-        assert event is None or event.name != "LEFT_HAND_UP"
-        assert event is None or event.name != "RIGHT_HAND_UP"
+        state = rec.recognize_current(make_pose(lm))
+        assert state.hand_action == HAND_NONE
 
-
-class TestStandSit:
-    """站立 / 坐下测试。"""
-
-    def test_stand(self) -> None:
-        """膝伸直(角度>160)触发 STAND。"""
+    def test_no_person_returns_none_action(self) -> None:
+        """未检测到人时 → HAND_NONE。"""
         rec = ActionRecognizer()
-        # 默认姿态髋膝踝垂直共线 -> 180 度
-        lm = make_landmarks()
-        event = rec.recognize(make_pose(lm))
-        # 优先级:FALL/BOTH_HANDS 不满足,可能触发 STAND
-        assert event is not None
-        assert event.name == "STAND"
+        state = rec.recognize_current(make_empty_pose())
+        assert state.hand_action == HAND_NONE
 
-    def test_sit(self) -> None:
-        """膝弯曲(角度<130)触发 SIT。"""
+
+# ---------- 5~8:镜像交换规则与匹配判定 ----------
+
+class TestMirrorAndMatch:
+    """镜像交换规则与 check_match 测试。"""
+
+    def test_mirror_left_wrist_is_user_right_hand(self) -> None:
+        """镜像规则验证:仅 MediaPipe LEFT_WRIST 高 → 用户右手举起。
+
+        这是 v4.2 最关键的镜像约定:不能直接"LEFT_WRIST 高就判 LEFT_HAND_UP"。
+        """
         rec = ActionRecognizer()
-        # 让膝弯曲:髋在膝上方,踝在膝右侧(90度)
-        lk = make_landmark(0.43, 0.75)
-        rk = make_landmark(0.57, 0.75)
-        la = make_landmark(0.55, 0.75)  # 左踝向右偏
-        ra = make_landmark(0.45, 0.75)  # 右踝向左偏
-        # 同时抬高髋部使坐姿合理
-        lh = make_landmark(0.43, 0.65)
-        rh = make_landmark(0.57, 0.65)
-        lm = make_landmarks(left_knee=lk, right_knee=rk, left_ankle=la, right_ankle=ra,
-                            left_hip=lh, right_hip=rh)
-        event = rec.recognize(make_pose(lm))
-        # 此时膝角度约 90 度,触发 SIT
-        assert event is not None
-        assert event.name == "SIT"
+        # 仅 LEFT_WRIST 高,RIGHT_WRIST 低
+        lw_up = make_landmark(0.36, 0.03)
+        rw_down = make_landmark(0.64, 0.55)
+        lm = make_landmarks(left_wrist=lw_up, right_wrist=rw_down)
+        state = rec.recognize_current(make_pose(lm))
+        # 镜像后应为 RIGHT_HAND_UP,而非 LEFT_HAND_UP
+        assert state.hand_action == "RIGHT_HAND_UP"
+        assert state.hand_action != "LEFT_HAND_UP"
 
-
-class TestFall:
-    """跌倒测试。"""
-
-    def test_fall_detected(self) -> None:
-        """肩髋高度差/肩宽 < 0.3 触发 FALL_DETECTED。"""
+    def test_mirror_right_wrist_is_user_left_hand(self) -> None:
+        """镜像规则验证:仅 MediaPipe RIGHT_WRIST 高 → 用户左手举起。"""
         rec = ActionRecognizer()
-        # 跌倒:身体水平,肩髋 y 接近
-        ls = make_landmark(0.40, 0.50)
-        rs = make_landmark(0.50, 0.50)  # 肩宽 0.10, 肩水平
-        lh = make_landmark(0.55, 0.52)  # 髋略低于肩
-        rh = make_landmark(0.65, 0.52)
-        # ratio = |0.51 - 0.52| / 0.10 = 0.1 < 0.3
-        lm = make_landmarks(left_shoulder=ls, right_shoulder=rs, left_hip=lh, right_hip=rh)
-        event = rec.recognize(make_pose(lm))
-        assert event is not None
-        assert event.name == "FALL_DETECTED"
+        lw_down = make_landmark(0.36, 0.55)
+        rw_up = make_landmark(0.64, 0.03)
+        lm = make_landmarks(left_wrist=lw_down, right_wrist=rw_up)
+        state = rec.recognize_current(make_pose(lm))
+        assert state.hand_action == "LEFT_HAND_UP"
+        assert state.hand_action != "RIGHT_HAND_UP"
 
-    def test_no_fall_when_standing(self) -> None:
-        """站立时不应触发跌倒。"""
-        rec = ActionRecognizer()
-        # 站立:肩 y=0.25, 髋 y=0.55, 肩宽 0.2
-        # ratio = 0.30 / 0.20 = 1.5 > 0.3, 不跌倒
-        lm = make_landmarks()
-        event = rec.recognize(make_pose(lm))
-        assert event is not None
-        assert event.name != "FALL_DETECTED"
+    def test_match_correct(self) -> None:
+        """目标动作与当前动作相同 → MATCH_CORRECT。"""
+        assert ActionRecognizer.check_match("LEFT_HAND_UP", "LEFT_HAND_UP") == MATCH_CORRECT
+        assert ActionRecognizer.check_match("RIGHT_HAND_UP", "RIGHT_HAND_UP") == MATCH_CORRECT
+        assert ActionRecognizer.check_match("BOTH_HANDS_UP", "BOTH_HANDS_UP") == MATCH_CORRECT
 
+    def test_match_wrong(self) -> None:
+        """目标动作与当前动作不同 → MATCH_WRONG(含 HAND_NONE)。"""
+        assert ActionRecognizer.check_match("LEFT_HAND_UP", "RIGHT_HAND_UP") == MATCH_WRONG
+        assert ActionRecognizer.check_match("LEFT_HAND_UP", "BOTH_HANDS_UP") == MATCH_WRONG
+        assert ActionRecognizer.check_match("BOTH_HANDS_UP", HAND_NONE) == MATCH_WRONG
+        assert ActionRecognizer.check_match("RIGHT_HAND_UP", HAND_NONE) == MATCH_WRONG
+
+
+# ---------- 9~10:冷却与重置 ----------
 
 class TestCooldownAndReset:
-    """冷却与重置测试。"""
+    """冷却与重置测试(使用 recognize,受冷却影响)。"""
 
     def test_cooldown_prevents_repeat(self) -> None:
         """冷却期内同一动作不应重复触发。"""
         rec = ActionRecognizer(cooldown=10.0)
-        lw = make_landmark(0.36, 0.03)
-        rw = make_landmark(0.64, 0.03)
-        # 用弯曲膝盖(角度~140°,介于 130/160 之间)避免 STAND/SIT 干扰
-        lk = make_landmark(0.43, 0.75)
-        rk = make_landmark(0.57, 0.75)
-        la = make_landmark(0.50, 0.83)
-        ra = make_landmark(0.50, 0.83)
-        lh = make_landmark(0.43, 0.65)
-        rh = make_landmark(0.57, 0.65)
-        lm = make_landmarks(left_wrist=lw, right_wrist=rw,
-                            left_knee=lk, right_knee=rk,
-                            left_ankle=la, right_ankle=ra,
-                            left_hip=lh, right_hip=rh)
+        lw_up = make_landmark(0.36, 0.03)
+        rw_up = make_landmark(0.64, 0.03)
+        lm = make_landmarks(left_wrist=lw_up, right_wrist=rw_up)
         # 第一次触发
         ev1 = rec.recognize(make_pose(lm))
         assert ev1 is not None
         assert ev1.name == "BOTH_HANDS_UP"
-        # 冷却期内再识别,不应触发任何动作
+        # 冷却期内再识别,不应触发
         ev2 = rec.recognize(make_pose(lm))
         assert ev2 is None
 
     def test_reset_clears_cooldown(self) -> None:
         """reset 后动作可立即再次触发。"""
         rec = ActionRecognizer(cooldown=10.0)
-        lw = make_landmark(0.36, 0.03)
-        rw = make_landmark(0.64, 0.03)
-        lk = make_landmark(0.43, 0.75)
-        rk = make_landmark(0.57, 0.75)
-        la = make_landmark(0.50, 0.83)
-        ra = make_landmark(0.50, 0.83)
-        lh = make_landmark(0.43, 0.65)
-        rh = make_landmark(0.57, 0.65)
-        lm = make_landmarks(left_wrist=lw, right_wrist=rw,
-                            left_knee=lk, right_knee=rk,
-                            left_ankle=la, right_ankle=ra,
-                            left_hip=lh, right_hip=rh)
+        lw_up = make_landmark(0.36, 0.03)
+        rw_up = make_landmark(0.64, 0.03)
+        lm = make_landmarks(left_wrist=lw_up, right_wrist=rw_up)
         ev1 = rec.recognize(make_pose(lm))
         assert ev1 is not None
         # 重置
@@ -248,13 +218,3 @@ class TestCooldownAndReset:
         ev2 = rec.recognize(make_pose(lm))
         assert ev2 is not None
         assert ev2.name == "BOTH_HANDS_UP"
-
-
-class TestNoPerson:
-    """无人时的测试。"""
-
-    def test_no_person_returns_none(self) -> None:
-        """未检测到人时返回 None。"""
-        rec = ActionRecognizer()
-        ev = rec.recognize(make_empty_pose())
-        assert ev is None

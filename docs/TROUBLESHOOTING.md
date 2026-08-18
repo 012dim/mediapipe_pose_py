@@ -12,9 +12,9 @@
    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
    ```
 2. 确认 Python 版本 3.10 / 3.11 / 3.12(MediaPipe 不支持 3.13+)
-3. 单独安装 mediapipe 看具体错误:
+3. 必须固定版本 `mediapipe==0.10.21`(新版不再提供 `mp.solutions`):
    ```bash
-   pip install mediapipe==0.10.14 -i https://pypi.tuna.tsinghua.edu.cn/simple
+   pip install mediapipe==0.10.21 -i https://pypi.tuna.tsinghua.edu.cn/simple
    ```
 4. 如果报 protobuf 冲突:
    ```bash
@@ -27,11 +27,27 @@
 
 **解决**:
 ```bash
-pip install opencv-python==4.9.0.80
+pip install opencv-contrib-python==4.9.0.80
 ```
+> 不要同时安装 `opencv-python`,否则两者会共同占用 `cv2` 命名空间导致冲突。
 > 不要装 `opencv-python-headless`,它不带 GUI 显示功能。
 
-### Q3:虚拟环境激活失败
+### Q3:`AttributeError: module 'mediapipe' has no attribute 'solutions'`
+
+**原因**:安装了 mediapipe 0.10.21 之后的新版本(如 0.10.35),不再提供 `mp.solutions.pose`。
+
+**解决**:
+```bash
+pip uninstall -y mediapipe opencv-python opencv-contrib-python numpy
+pip install -r requirements.txt
+```
+验证:
+```bash
+python -c "import mediapipe as mp; print(mp.__version__); print(hasattr(mp, 'solutions'))"
+```
+预期输出 `0.10.21` 和 `True`。
+
+### Q4:虚拟环境激活失败
 
 **Windows PowerShell 报错"无法加载文件,因为在此系统上禁止运行脚本"**:
 ```powershell
@@ -44,7 +60,7 @@ venv\Scripts\activate
 
 ## 运行相关
 
-### Q4:启动报 `无法打开摄像头 0,请检查设备或修改 config.py 中的 CAMERA_ID`
+### Q5:启动报 `无法打开摄像头 0,请检查设备或修改 config.py 中的 CAMERA_ID`
 
 **排查步骤**:
 1. **检查摄像头是否被占用**:关闭 Zoom、微信、QQ 等可能使用摄像头的软件
@@ -57,27 +73,27 @@ venv\Scripts\activate
    # 重新登录后生效
    ```
 
-### Q5:启动报 `MediaPipe Pose 初始化失败`
+### Q6:启动报 `MediaPipe Pose 初始化失败`
 
 **原因**:通常是 mediapipe 安装不完整或 protobuf 版本冲突。
 
 **解决**:
 ```bash
 pip uninstall mediapipe protobuf -y
-pip install mediapipe==0.10.14
+pip install mediapipe==0.10.21
 pip install protobuf==3.20.3 --force-reinstall
 ```
 
-### Q6:`cv2.imshow` 窗口无响应 / 一直转圈
+### Q7:`cv2.imshow` 窗口无响应 / 一直转圈
 
 **原因**:OpenCV 安装错误,或主循环没有调用 `cv2.waitKey`。
 
 **解决**:
-1. 确认装的是 `opencv-python` 而非 `opencv-python-headless`
+1. 确认装的是 `opencv-contrib-python` 而非 `opencv-python-headless`
 2. Linux 无图形界面(SSH)需用 X11 转发或 VNC,建议直接在桌面环境运行
 3. 确认 `main.py` 主循环有 `cv2.waitKey(1)`
 
-### Q7:FPS 很低(< 15)
+### Q8:FPS 很低(< 15)
 
 **优化方法**(按效果排序):
 1. 降低模型复杂度:`config.py` 中 `MODEL_COMPLEXITY = 0`(轻量,提升 50%+)
@@ -87,7 +103,7 @@ pip install protobuf==3.20.3 --force-reinstall
 5. 改善光照(光照差时 MediaPipe 推理更慢)
 6. 用 USB 3.0 接口(避免 USB 2.0 带宽不足)
 
-### Q8:骨骼闪烁 / 关键点位置跳动
+### Q9:骨骼闪烁 / 关键点位置跳动
 
 **原因**:MediaPipe 推理本身有抖动,光照不足时更明显。
 
@@ -99,7 +115,7 @@ pip install protobuf==3.20.3 --force-reinstall
 
 ## 动作识别相关
 
-### Q9:举手没有反应
+### Q10:举手没有反应
 
 **排查**:
 1. 确认手腕真的高于鼻子(超过 5% 画面高度,即 y 差 > 0.05)
@@ -108,23 +124,14 @@ pip install protobuf==3.20.3 --force-reinstall
 4. 按 `r` 重置冷却后重试(可能上一次触发还在冷却中)
 5. 检查 `wrist.visibility` 是否 < 0.3(被遮挡)
 
-### Q10:跌倒误报(明明站着却显示 FALL_DETECTED)
+### Q11:左右手识别反了
 
-**原因**:跌倒判定比率 `|肩Y − 髋Y| / 肩宽 < 0.3`,坐姿或半蹲可能误判。
-
-**解决**:
-1. 调高 `FALL_RATIO_THRESHOLD`(如 0.4)
-2. 检查肩膀是否水平(头部歪斜会导致 shoulder_dy > 0.2 被排除,但有时仍误判)
-3. 跌倒后立即站起,避免长时间停留
-
-### Q11:STAND / SIT 切换不灵敏
-
-**原因**:膝关节角度阈值边界设置。
+**原因**:画面已做水平翻转(镜像),代码中 LEFT_WRIST / RIGHT_WRIST 已交换判定。
 
 **解决**:
-- 站立时角度通常 170-180°,坐下时 80-110°
-- 中间区域(130-160°)不触发任何动作(半蹲状态)
-- 如需更灵敏:调低 `KNEE_ANGLE_SIT`(如 120)或调高 `KNEE_ANGLE_STAND`(如 150)
+- 这是设计行为:MediaPipe 的 LEFT_WRIST 实际对应用户右手(镜像后)
+- 若仍反,检查是否修改过 `action_recognizer.py` 的 `_detect_hand_action`
+- 确认主循环执行了 `cv2.flip(frame, 1)`
 
 ### Q12:同一动作不停触发
 
@@ -137,31 +144,62 @@ pip install protobuf==3.20.3 --force-reinstall
 
 ## 串口相关
 
-### Q13:串口打不开,但程序继续运行
+### Q13:`SERIAL_ENABLED=False` 时状态机卡在 SAFE_STOP
 
-**这是预期行为**:串口是可选外设,失败仅警告不崩溃。日志会显示:
-```
-串口 COM3 打开失败: ...,继续运行(动作识别正常,仅不发送)。
-```
+**原因**:旧版 `PumpGroupSender` 在 `SERIAL_ENABLED=False` 时 send 返回 False,触发 SAFE_STOP。
 
-**修复**:
-1. 确认 Arduino 已连接,设备管理器查看端口名
-2. 关闭 Arduino IDE 的串口监视器(占用冲突)
-3. 修改 `config.py` 中 `DEFAULT_SERIAL_PORT_WIN = "COM4"`(实际端口)
-4. 安装驱动:CH340 / CP2102 等 USB 转串口芯片需装驱动
-5. 确认装了 pyserial:`pip install pyserial`
+**解决**:确认使用 v4.2 代码,`PumpGroupSender(test_mode=not config.SERIAL_ENABLED)` 已自动启用 test_mode,跳过发送并返回成功。
 
-### Q14:Arduino 收不到数据
+### Q14:串口 COM3/5/7 打不开(OSError 121)
+
+**原因**:Windows 错误 121 通常是端口被占用或 CH340 驱动异常。
+
+**解决**:
+1. 拔插 USB 重新枚举
+2. 关闭其他占用该 COM 的程序(Arduino IDE 串口监视器等)
+3. 重装 CH340 驱动
+4. 在设备管理器中确认 4 块 UNO 的实际 COM 编号,更新 `config.py` 的 `PUMP_BOARDS` 与 `LIGHT_SERIAL_PORT`
+5. 代码侧已容错,不会因此崩溃
+
+### Q15:启动时提示"泵控板 PUMP_X 连接失败"
+
+**原因**:`SERIAL_ENABLED=True` 时,3 板泵控 UNO 必须全部连接且 READY 板号匹配。
+
+**解决**:
+1. 确认 3 块 UNO 已通过 USB 连接
+2. 确认每块 UNO 烧录了正确的 `BOARD_ID`(PUMP_A / PUMP_B / PUMP_C)
+3. 确认 COM 口与 `config.py` 的 `PUMP_BOARDS` 一致
+4. 检查日志中是否收到 `READY,<板号>` 响应;若板号不匹配会拒绝连接
+
+### Q16:Arduino 收不到数据
 
 **排查**:
 1. 波特率要一致(默认 9600),Arduino 端 `Serial.begin(9600)`
 2. 检查 RX/TX 是否接反(Arduino RX ↔ 模块 TX)
 3. 共地(Arduino GND 与模块 GND 相连)
-4. 在 Arduino IDE 串口监视器手动发 `POSE,BOTH_HANDS_UP\n` 测试接收逻辑
+4. 用 Arduino IDE 串口监视器手动发以下指令测试:
+   ```
+   STATUS
+   TEST_PUMP,0,1
+   INFLATE_ALL,1
+   DEFLATE_ALL,1
+   STOP_ALL
+   LIGHT_ON,1
+   LIGHT_ALL_OFF
+   ```
+
+### Q17:进入 SAFE_STOP 后无法恢复
+
+**这是设计行为**:SAFE_STOP 是终态,任一泵控板发送失败后进入,不自动恢复。
+
+**解决**:
+1. 检查日志中的 `[SAFE_STOP]` 记录,确认哪块板失败
+2. 修复硬件/连接后,按 `q` 退出程序
+3. 重新启动程序(SAFE_STOP 不能通过 `r` 重置,必须重启)
 
 ## 退出相关
 
-### Q15:按 q 或 Ctrl+C 退出时有 Python 异常堆栈
+### Q18:按 q 或 Ctrl+C 退出时有 Python 异常堆栈
 
 **原因**:资源释放顺序或信号处理问题。
 
@@ -170,7 +208,7 @@ pip install protobuf==3.20.3 --force-reinstall
 2. 不要直接杀进程,用 q 或 Esc 优雅退出
 3. 如仍有异常,把日志贴到 issue
 
-### Q16:窗口关了但进程没退出
+### Q19:窗口关了但进程没退出
 
 **原因**:OpenCV 在某些 Windows 版本上 `cv2.imshow` 关闭事件不触发。
 
@@ -190,7 +228,7 @@ pip install protobuf==3.20.3 --force-reinstall
 ```python
 LOG_LEVEL = "DEBUG"
 ```
-可看到每帧的推理详情、按键码等。
+可看到每帧的推理详情、按键码、串口发送记录等。
 
 ### 单独测试摄像头
 
@@ -207,13 +245,17 @@ cap.release()
 cv2.destroyAllWindows()
 ```
 
-### 查看关键点坐标
+### 查看 Arduino 串口响应
 
-在 `main.py` 主循环加一行打印鼻子坐标:
-```python
-if pose_result.landmarks:
-    nose = pose_result.landmarks[0]
-    print(f"nose: x={nose.x:.3f} y={nose.y:.3f} vis={nose.visibility:.2f}")
+用 Arduino IDE 串口监视器(波特率 9600)发送指令并查看响应:
+```
+发送: STATUS
+返回: STATUS,PUMP_A,mode=IDLE,relay=000000,servo=000000
+
+发送: TEST_PUMP,0,1
+返回: ACK,PUMP_A,TEST_PUMP
+(1秒后)
+返回: READY,PUMP_A   (测试完成)
 ```
 
 ### 性能分析
@@ -231,4 +273,5 @@ py-spy top --pid <python_pid>
 2. Python 版本:`python --version`
 3. 依赖版本:`pip list | grep -E "mediapipe|opencv|numpy"`
 4. 摄像头型号(USB / 笔记本内置)
-5. 完整错误日志(开启 DEBUG 级别)
+5. Arduino 接线情况(4 块 UNO 的 COM 口)
+6. 完整错误日志(开启 DEBUG 级别)

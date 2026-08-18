@@ -1,9 +1,9 @@
 ================================================================================
-灯箱控制 Arduino Uno (Uno-B) 程序说明
+灯箱控制 Arduino Uno (LIGHT 板) 程序说明  (v4.2)
 ================================================================================
 
 【硬件接线】
-  Uno-B 控制 3 个灯泡,通过 3 路继电器模块驱动:
+  LIGHT 板控制 3 个灯泡,通过 3 路继电器模块驱动:
     - 每个灯泡占用 1 路继电器(通/断电控制亮灭)。
     - 继电器为低电平触发(常见 5V 继电器模块)。
 
@@ -27,6 +27,14 @@
   LIGHT_FLASH,3         三灯同时闪烁 3 次(用于 ENDING 结束阶段)
                         每次亮 300ms、灭 300ms
 
+【响应格式(v4.2 握手)】
+  上电就绪:  READY,LIGHT
+  指令成功:  ACK,LIGHT,<命令>     例如 ACK,LIGHT,LIGHT_ON
+  指令失败:  ERR,LIGHT,<原因>     例如 ERR,LIGHT,BAD_LIGHT_ID
+
+  Python 端 connect(expected_board_id="LIGHT") 会校验 READY 中的板号,
+  每条指令通过 send_and_wait() 等待 ACK/ERR(超时即视为失败)。
+
 【与状态机的配合】
   状态机(Python 端)在以下时机发送指令:
     EXTRACTING   抽到目标动作后,发送 LIGHT_ON,<对应灯编号>
@@ -39,11 +47,11 @@
     安全放气     发送 STOP_ALL(气泵) -> LIGHT_ALL_OFF -> DEFLATE_ALL(气泵)
 
 ================================================================================
-【Arduino 参考代码(复制到 Arduino IDE 上传至 Uno-B)】
+【Arduino 参考代码(复制到 Arduino IDE 上传至灯箱 UNO / LIGHT 板)】
 ================================================================================
 
 /*
- * 灯箱控制 Uno-B
+ * 灯箱控制 Uno (LIGHT 板) v4.2
  * 接收串口指令控制 3 路继电器(3 个灯泡)
  *
  * 串口协议(9600 baud,每行一条指令,以 '\n' 结尾):
@@ -51,11 +59,20 @@
  *   LIGHT_OFF,id    熄灭指定灯
  *   LIGHT_ALL_OFF   全部熄灭
  *   LIGHT_FLASH,n   三灯闪烁 n 次
+ *
+ * 响应(每条指令执行后回送):
+ *   READY,LIGHT                 上电就绪
+ *   ACK,LIGHT,<命令>            指令执行成功
+ *   ERR,LIGHT,<原因>            指令拒绝/失败
  */
 
 /* =====================================================================
  * ★★★ 用户可调参数区(在 Arduino IDE 中修改此处即可)★★★
  * ===================================================================== */
+
+// ---- 板 ID ----
+// 固定为 "LIGHT",Python 端 connect(expected_board_id="LIGHT") 会校验
+const char BOARD_ID[] = "LIGHT";
 
 // ---- 引脚定义 ----
 // LIGHT_PINS:3 个灯泡的继电器引脚,分别对应灯1/灯2/灯3
@@ -136,9 +153,36 @@ void flashAll(int times) {
   }
 }
 
+// ============ 响应函数 ============
+
+/**
+ * sendACK - 指令执行成功,回送 ACK,LIGHT,<命令>
+ * @param cmd 原命令名(如 "LIGHT_ON")
+ */
+void sendACK(const String &cmd) {
+  Serial.print("ACK,");
+  Serial.print(BOARD_ID);
+  Serial.print(",");
+  Serial.println(cmd);
+}
+
+/**
+ * sendERR - 指令拒绝/失败,回送 ERR,LIGHT,<原因>
+ * @param reason 失败原因(如 "BAD_LIGHT_ID")
+ */
+void sendERR(const String &reason) {
+  Serial.print("ERR,");
+  Serial.print(BOARD_ID);
+  Serial.print(",");
+  Serial.println(reason);
+}
+
 /**
  * setup - Arduino 上电后执行一次
  * 初始化串口、引脚,熄灭所有灯泡,打印就绪信息
+ *
+ * v4.2:READY 格式与泵控板统一为 "READY,<板号>",
+ * Python 端 connect(expected_board_id="LIGHT") 会校验板号
  */
 void setup() {
   Serial.begin(9600);   // 开启串口,波特率 9600(与 Python 端一致)
@@ -147,7 +191,9 @@ void setup() {
     pinMode(LIGHT_PINS[i], OUTPUT);   // 灯(i+1)继电器引脚
   }
   allOff();   // 初始状态:全部灯泡熄灭(安全)
-  Serial.println("Lightbox Uno-B ready");   // 向 Python 端报告就绪
+  // 上电就绪:回送 READY,LIGHT(与泵控板 READY 格式统一)
+  Serial.print("READY,");
+  Serial.println(BOARD_ID);
 }
 
 /**
@@ -155,31 +201,49 @@ void setup() {
  *
  * 每轮检查串口是否有新指令,有则解析并执行。
  * 灯泡状态为持续保持(点亮后一直亮,直到收到熄灭指令),无需定时检查。
+ *
+ * v4.2:每条指令执行后回送 ACK/ERR,Python 端 send_and_wait() 据此判断成败。
  */
 void loop() {
   if (Serial.available()) {                     // 串口缓冲区有数据
     String line = Serial.readStringUntil('\n'); // 读取一行(到 '\n')
     line.trim();                                // 去除首尾空白/回车
 
-    if (line.startsWith("LIGHT_ON,")) {
+    if (line.length() == 0) {
+      // 空行忽略
+    } else if (line.startsWith("LIGHT_ON,")) {
       // 指令:LIGHT_ON,id -> 点亮指定灯
       // substring(9) 截取 "LIGHT_ON," 之后的数字部分
       int id = line.substring(9).toInt();       // 解析灯号(1/2/3)
-      if (id >= 1 && id <= 3) setLight(id - 1, true);  // id 转 0 基索引
+      if (id >= 1 && id <= 3) {
+        setLight(id - 1, true);                 // id 转 0 基索引
+        sendACK("LIGHT_ON");
+      } else {
+        sendERR("BAD_LIGHT_ID");                // 非法灯号
+      }
     } else if (line.startsWith("LIGHT_OFF,")) {
       // 指令:LIGHT_OFF,id -> 熄灭指定灯
       // substring(10) 截取 "LIGHT_OFF," 之后的数字部分
       int id = line.substring(10).toInt();
-      if (id >= 1 && id <= 3) setLight(id - 1, false);
+      if (id >= 1 && id <= 3) {
+        setLight(id - 1, false);
+        sendACK("LIGHT_OFF");
+      } else {
+        sendERR("BAD_LIGHT_ID");
+      }
     } else if (line == "LIGHT_ALL_OFF") {
       // 指令:LIGHT_ALL_OFF -> 全部熄灭
       allOff();
+      sendACK("LIGHT_ALL_OFF");
     } else if (line.startsWith("LIGHT_FLASH,")) {
       // 指令:LIGHT_FLASH,n -> 三灯闪烁 n 次
       // substring(12) 截取 "LIGHT_FLASH," 之后的数字部分
       int times = line.substring(12).toInt();
       if (times <= 0) times = 3;   // 容错:未指定或非法时默认闪 3 次
       flashAll(times);
+      sendACK("LIGHT_FLASH");      // 即使 times 被容错修正,也回送成功
+    } else {
+      sendERR("UNKNOWN_CMD");      // 未知指令
     }
   }
 }
@@ -199,9 +263,12 @@ void loop() {
          const unsigned long FLASH_ON_MS = 300;   // 亮 300ms
          const unsigned long FLASH_OFF_MS = 300;  // 灭 300ms
 
-  修改后重新上传至 Uno-B 即可生效。
+    4. 板 ID 必须保持 "LIGHT",与 Python 端 expected_board_id="LIGHT" 一致:
+         const char BOARD_ID[] = "LIGHT";
+
+  修改后重新上传至灯箱 UNO(LIGHT 板)即可生效。
 ================================================================================
 
 注意:本文件为参考文档,Python 程序不会执行本文件。
-      请将上面【Arduino 参考代码】部分复制到 Arduino IDE 并上传至 Uno-B。
+      请将上面【Arduino 参考代码】部分复制到 Arduino IDE 并上传至灯箱 UNO(LIGHT 板)。
 ================================================================================

@@ -29,7 +29,7 @@ from modules.action_recognizer import ActionRecognizer, ActionEvent, HandActionS
 from modules.camera import Camera
 from modules.pose_detector import PoseDetector, PoseResult
 from modules.serial_sender import LightSender, PumpGroupSender
-from modules.state_machine import StateMachine
+from modules.state_machine import StateMachine, STATE_SAFE_STOP
 from modules.visualizer import Visualizer
 
 # ============ 日志配置 ============
@@ -126,7 +126,7 @@ class Application:
                 self.pump_group.stop_all_best_effort()
                 self._cleanup()
                 return 2
-            if not self.light_sender.connect():
+            if not self.light_sender.connect(expected_board_id="LIGHT"):
                 logger.error("灯箱串口 %s 连接失败;拒绝进入运行态",
                              config.LIGHT_SERIAL_PORT)
                 self.pump_group.stop_all_best_effort()
@@ -243,6 +243,10 @@ class Application:
         elif key == ord("c"):
             self._switch_camera()
         elif key == ord("r"):
+            # 报告 7.4:SAFE_STOP 态下禁止通过 r 重新充气(必须退出重启)
+            if self.state_machine is not None and self.state_machine.state == STATE_SAFE_STOP:
+                logger.warning("SAFE_STOP 状态下不能通过 r 重置,请按 q 退出后重启")
+                return
             self.action_recognizer.reset()
             self.visualizer._active_event = None  # noqa: SLF001
             self._last_state = None

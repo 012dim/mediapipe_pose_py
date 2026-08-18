@@ -29,11 +29,12 @@
 ## 快速开始
 
 ```bash
-# 1. 创建虚拟环境
-python -m venv venv
+# 1. 创建虚拟环境(Python 3.10 / 3.11 / 3.12)
+py -3.12 -m venv venv
 venv\Scripts\activate
 
 # 2. 安装依赖(使用清华镜像加速)
+pip install --upgrade pip
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 3. 运行
@@ -41,6 +42,13 @@ python main.py
 ```
 
 > macOS / Linux 激活虚拟环境:`source venv/bin/activate`
+
+### 运行模式(由 `config.py` 的 `SERIAL_ENABLED` 控制)
+
+- **`SERIAL_ENABLED = False`(默认,测试模式)**:只测试摄像头、动作识别和状态机界面,不连接 Arduino。串口发送静默失败(返回成功),状态机正常流转。适用于无硬件的开发/测试环境。
+- **`SERIAL_ENABLED = True(正式运行)**:连接 4 块 UNO(3 块泵控 + 1 块灯箱)并控制真实硬件。3 板泵控必须全部连接且 READY 板号匹配才进入运行态,否则拒绝启动。
+
+> **注意**:默认 `SERIAL_ENABLED=False`,不会控制气泵。正式展览/联机测试时必须改为 `True` 并正确配置 `PUMP_BOARDS` 与 `LIGHT_SERIAL_PORT`。
 
 启动后进入 INIT 充气阶段(5 秒),随后等待人物出现。按 `q` 退出。
 

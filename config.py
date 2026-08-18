@@ -3,8 +3,6 @@
 修改本文件即可调整摄像头、MediaPipe、动作识别、串口等所有参数,
 无需改动业务代码。
 """
-import platform
-
 
 # ============ 摄像头配置 ============
 CAMERA_ID: int = 0                  # 默认摄像头 ID
@@ -93,21 +91,6 @@ INFLATE_M_MS_PER_BOARD: dict = {
 # ============ SAFE_STOP 错误态配置 ============
 # 任一泵控板发送失败时,全组进入 SAFE_STOP:广播 STOP_ALL,等待放气后退出
 SAFE_STOP_DEFLATE_TIME: float = 5.0   # SAFE_STOP 时强制放气秒数
-
-
-def get_default_serial_port() -> str:
-    """根据当前操作系统返回默认串口端口名。
-
-    Returns:
-        str: 串口路径,例如 Windows 返回 'COM3'。
-    """
-    system = platform.system()
-    if system == "Windows":
-        return DEFAULT_SERIAL_PORT_WIN
-    elif system == "Linux":
-        return DEFAULT_SERIAL_PORT_LINUX
-    else:
-        return DEFAULT_SERIAL_PORT_MAC
 
 
 # ============ 路径配置 ============

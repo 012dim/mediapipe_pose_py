@@ -139,12 +139,12 @@ class StateMachine:
         # 当前稳定亮着的灯号集合 {1,2,3}(ENDING 闪烁/其他灭灯时为空集)
         self._lights_on: set = set()
 
-        # 计时变量
-        self._state_enter_time: float = time.time()
-        self._last_update_time: float = time.time()
+        # 计时变量(使用 monotonic 时钟,避免系统时间被校准或手动修改影响倒计时)
+        self._state_enter_time: float = time.monotonic()
+        self._last_update_time: float = time.monotonic()
         self._person_confirm_start: float = 0.0       # WAITING 中人持续在线起点
         self._person_confirm_elapsed: float = 0.0
-        self._last_person_seen_time: float = time.time()
+        self._last_person_seen_time: float = time.monotonic()
         self._counting_duration: float = 0.0           # COUNTING 目标时长
         self._counting_elapsed: float = 0.0            # COUNTING 已计时(扣除 INFLATING)
         self._last_inflate_m_time: float = 0.0         # 上次 INFLATE_M 时间
@@ -169,7 +169,7 @@ class StateMachine:
         Returns:
             StateSnapshot: 当前状态快照(供可视化)。
         """
-        now = time.time()
+        now = time.monotonic()
         dt = now - self._last_update_time if self._last_update_time > 0 else 0.0
         self._last_update_time = now
 
@@ -203,7 +203,7 @@ class StateMachine:
     # ============ 状态进入方法 ============
     def _enter_init(self) -> None:
         self.state = STATE_INIT
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self.gass = 0
         self.n_count = 0
         self.target_action = HAND_NONE
@@ -220,7 +220,7 @@ class StateMachine:
 
     def _enter_waiting(self) -> None:
         self.state = STATE_WAITING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self.gass = int(config.INFLATE_TIME_A)
         self._person_confirm_start = 0.0
         self._person_confirm_elapsed = 0.0
@@ -228,7 +228,7 @@ class StateMachine:
 
     def _enter_extracting(self) -> None:
         self.state = STATE_EXTRACTING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self.n_count += 1
         self.target_action = random.choice(ACTION_POOL)
         light_id = self.light.light_id_for_action(self.target_action)
@@ -244,7 +244,7 @@ class StateMachine:
     def _enter_counting_fresh(self) -> None:
         """从 EXTRACTING 进入 COUNTING:随机生成计时时长。"""
         self.state = STATE_COUNTING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self._counting_duration = random.uniform(
             config.COUNT_MIN_N2, config.COUNT_MAX_N3,
         )
@@ -255,33 +255,33 @@ class StateMachine:
     def _enter_counting_resume(self) -> None:
         """从 INFLATING 回到 COUNTING:保留原计时,继续累计。"""
         self.state = STATE_COUNTING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         logger.info("[COUNTING] 恢复计时,剩余 %.2f 秒",
                     max(0.0, self._counting_duration - self._counting_elapsed))
 
     def _enter_inflating(self) -> None:
         self.state = STATE_INFLATING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self._last_inflate_m_time = 0.0  # 触发立即发送第一次
         logger.info("[INFLATING] 动作错误,开始惩罚充气,当前 gass=%d", self.gass)
 
     def _enter_interval(self) -> None:
         self.state = STATE_INTERVAL
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self.light.send_all_off()
         self._lights_on = set()
         logger.info("[INTERVAL] 灭灯,等待 %.1f 秒", config.LOOP_INTERVAL)
 
     def _enter_ending(self) -> None:
         self.state = STATE_ENDING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self.light.send_flash(config.LOOP_COUNT_MAX)
         logger.info("[ENDING] 三灯闪 %d 次,等待人离开 ≥ %.1f 秒",
                     config.LOOP_COUNT_MAX, config.ABSENCE_TIMEOUT_N4)
 
     def _enter_deflating(self) -> None:
         self.state = STATE_DEFLATING
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         if not self.pump.send_deflate_all(config.DEFLATE_TIME_B):
             self._enter_safe_stop()
             return
@@ -292,17 +292,24 @@ class StateMachine:
     def _enter_safe_stop(self) -> None:
         """安全停止态:任一泵控板发送失败时进入。
 
-        PumpGroupSender 内部已 best-effort 广播 STOP_ALL,此处再尝试放气,
-        放气满 SAFE_STOP_DEFLATE_TIME 秒后保持等待退出(不自动恢复)。
+        报告 7.3 流程:
+        1. 先 best-effort 停止当前泵动作(stop_all_best_effort)
+        2. 灯箱全灭
+        3. 再让仍在线的板持续放气(send_deflate_all_best_effort)
+           — 部分失败不再 STOP_ALL,确保正常板电磁阀持续打开
+        4. 放气满 SAFE_STOP_DEFLATE_TIME 秒后保持等待退出(不自动恢复)
         """
         self.state = STATE_SAFE_STOP
-        self._state_enter_time = time.time()
+        self._state_enter_time = time.monotonic()
         self._lights_on = set()
-        # best-effort 尝试放气(可能也失败,但尽力)
-        self.pump.send_deflate_all(config.SAFE_STOP_DEFLATE_TIME)
+        # 1. 先尽力停止当前泵动作
+        self.pump.stop_all_best_effort()
+        # 2. 灯箱全灭
         self.light.send_all_off()
-        logger.error("[SAFE_STOP] 泵控板发送失败,全组停机,放气 %.1f 秒后等待用户退出",
-                     config.SAFE_STOP_DEFLATE_TIME)
+        # 3. 再让仍在线的板持续放气(部分失败不再 STOP_ALL,避免取消正常板放气)
+        results = self.pump.send_deflate_all_best_effort(config.SAFE_STOP_DEFLATE_TIME)
+        logger.error("[SAFE_STOP] 泵控板发送失败,全组停机,放气 %.1f 秒,deflate results=%s",
+                     config.SAFE_STOP_DEFLATE_TIME, results)
 
     # ============ 状态更新方法 ============
     def _update_init(self, now: float, dt: float, person: bool, hand: str) -> None:
