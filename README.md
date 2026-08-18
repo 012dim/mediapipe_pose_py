@@ -2,7 +2,7 @@
 
 基于 Google MediaPipe Pose 的实时手部动作识别项目,并扩展为 4 板 Arduino Uno 控制的气泵 + 灯箱交互系统。摄像头实时识别手部动作,驱动 9 状态有限状态机,通过串口指令控制 9 泵同步充放气与灯箱亮灭,实现"抽题 → 计时 → 惩罚充气 → 结束放气"的完整交互流程。
 
-> **架构版本**:v4.2 — 3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用 RC 脉冲 + 继电器供电隔离模型。
+> **架构版本**:v4.3 — 3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用**占空比 PWM + 继电器供电隔离**模型(报告 c15a9b0 P0:弃用 RC Servo 脉冲,改用 `analogWrite()` 硬件 PWM;新增 `VALVE_ENERGIZED_MEANS_OPEN` 阀极性配置)。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10.21-green) ![OpenCV](https://img.shields.io/badge/OpenCV-4.9.0.80-orange) ![Arduino](https://img.shields.io/badge/Arduino-Uno-00979D) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -11,7 +11,7 @@
 - **实时 33 关键点检测**:MediaPipe Pose 全身关键点,平滑滤波减少抖动
 - **3 种手部动作识别**:左手举起 / 右手举起 / 双手举起(画面镜像,与用户直觉一致)
 - **9 状态有限状态机**:INIT → WAITING → EXTRACTING → COUNTING ⇄ INFLATING → INTERVAL → ENDING → DEFLATING → 循环;新增 SAFE_STOP 安全停止态
-- **4 板 Arduino 控制**:3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备,RC 脉冲 + 继电器供电隔离)+ 1 块灯箱 UNO(3 灯泡),共 9 泵 9 阀同步动作
+- **4 板 Arduino 控制**:3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备,占空比 PWM + 继电器供电隔离)+ 1 块灯箱 UNO(3 灯泡),共 9 泵 9 阀同步动作
 - **智能计时**:只有动作正确时才推进计时,错误/无动作时暂停(不重置)
 - **安全机制**:人离开超时自动放气;充气达上限锁定后续充气,放气后恢复;任一泵控板发送失败 → 全组进入 SAFE_STOP(广播 STOP_ALL + 放气后等待退出)
 - **误检防护**:核心关键点可见度校验 + 高置信度阈值,挡掉椅子/衣架等误检
@@ -89,22 +89,31 @@ python main.py
    │  PUMP_A (泵A)    │  │  PUMP_B (泵B)    │  │  PUMP_C (泵C)    │  │  LIGHT (灯箱)    │
    │  COM3 @ 9600    │  │  COM5 @ 9600    │  │  COM7 @ 9600    │  │  COM4 @ 9600    │
    │                 │  │                 │  │                 │  │                 │
-   │  D2 → RELAY 泵1 │  │  D2 → RELAY 泵1 │  │  D2 → RELAY 泵1 │  │  D2 → RELAY 灯1 │
-   │  D3 → RELAY 阀1 │  │  D3 → RELAY 阀1 │  │  D3 → RELAY 阀1 │  │  D3 → RELAY 灯2 │
-   │  D4 → RELAY 泵2 │  │  D4 → RELAY 泵2 │  │  D4 → RELAY 泵2 │  │  D4 → RELAY 灯3 │
-   │  D5 → RELAY 阀2 │  │  D5 → RELAY 阀2 │  │  D5 → RELAY 阀2 │  └─────────────────┘
-   │  D6 → RELAY 泵3 │  │  D6 → RELAY 泵3 │  │  D6 → RELAY 泵3 │
-   │  D7 → RELAY 阀3 │  │  D7 → RELAY 阀3 │  │  D7 → RELAY 阀3 │
-   │  D8  → S 线 泵1 │  │  D8  → S 线 泵1 │  │  D8  → S 线 泵1 │
-   │  D9  → S 线 阀1 │  │  D9  → S 线 阀1 │  │  D9  → S 线 阀1 │
-   │  D10 → S 线 泵2 │  │  D10 → S 线 泵2 │  │  D10 → S 线 泵2 │
-   │  D11 → S 线 阀2 │  │  D11 → S 线 阀2 │  │  D11 → S 线 阀2 │
-   │  D12 → S 线 泵3 │  │  D12 → S 线 泵3 │  │  D12 → S 线 泵3 │
-   │  D13 → S 线 阀3 │  │  D13 → S 线 阀3 │  │  D13 → S 线 阀3 │
+   │  D2  → RELAY 泵1 │  │  D2  → RELAY 泵1 │  │  D2  → RELAY 泵1 │  │  D2 → RELAY 灯1 │
+   │  D3  → PWM   泵1 │  │  D3  → PWM   泵1 │  │  D3  → PWM   泵1 │  │  D3 → RELAY 灯2 │
+   │  D4  → RELAY 阀1 │  │  D4  → RELAY 阀1 │  │  D4  → RELAY 阀1 │  │  D4 → RELAY 灯3 │
+   │  D5  → PWM   阀1 │  │  D5  → PWM   阀1 │  │  D5  → PWM   阀1 │  └─────────────────┘
+   │  D7  → RELAY 泵2 │  │  D7  → RELAY 泵2 │  │  D7  → RELAY 泵2 │
+   │  D6  → PWM   泵2 │  │  D6  → PWM   泵2 │  │  D6  → PWM   泵2 │  ★ v4.3 引脚重分配
+   │  D8  → RELAY 阀2 │  │  D8  → RELAY 阀2 │  │  D8  → RELAY 阀2 │   6 路 PWM 全部走
+   │  D9  → PWM   阀2 │  │  D9  → PWM   阀2 │  │  D9  → PWM   阀2 │   硬件 PWM 引脚
+   │  D12 → RELAY 泵3 │  │  D12 → RELAY 泵3 │  │  D12 → RELAY 泵3 │   (D3/5/6/9/10/11)
+   │  D10 → PWM   泵3 │  │  D10 → PWM   泵3 │  │  D10 → PWM   泵3 │   继电器改用非 PWM
+   │  D13 → RELAY 阀3 │  │  D13 → RELAY 阀3 │  │  D13 → RELAY 阀3 │   数字引脚
+   │  D11 → PWM   阀3 │  │  D11 → PWM   阀3 │  │  D11 → PWM   阀3 │
    └─────────────────┘  └─────────────────┘  └─────────────────┘
 ```
 
-> **泵控板硬件模型(v4.2)**:每台设备(泵/阀)占用 1 路继电器(供电通断,D2-D7)+ 1 路 S 线(RC 脉冲,D8-D13,由 Servo 库生成)。继电器闭合 → 设备得电;Servo 输出 RC 脉冲 → 控制设备启停。3 块泵控板烧同一份 [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino),仅修改顶部 `BOARD_ID` 即可区分。
+> **泵控板硬件模型(v4.3)**:每台设备(泵/阀)占用 1 路继电器(供电通断,D2/4/7/8/12/13)+ 1 路 PWM S 线(占空比,D3/5/6/9/10/11,由 `analogWrite()` 生成)。继电器闭合 → 设备得电;PWM 占空比 `PWM_ON_DUTY=255` → 启动,`PWM_OFF_DUTY=0` → 停止。
+>
+> ★ **v4.3 关键变更(报告 c15a9b0 P0)**:
+> - 弃用 `<Servo.h>` + `writeMicroseconds(1500/2000)`(RC 脉冲),改用 `analogWrite()` 占空比 PWM(用户已确认电子开关为 PWM 类型)
+> - 引脚重分配:6 路 S 信号全部位于 UNO 硬件 PWM 引脚(D3/5/6/9/10/11),继电器改用非 PWM 数字引脚
+> - 新增 `VALVE_ENERGIZED_MEANS_OPEN` 配置,解耦"通电"与"阀开"语义(★ **必须由实物实测确定**)
+> - 区分 `normalPumpOff`(PWM OFF 保持 50ms 再断继电器)与 `emergencyPumpOff`(立即硬断电)
+> - 严格数值解析 `parseStrictUInt` / `parseStrictFloatSeconds` 替代 `toInt`/`toFloat`(报告 P2)
+>
+> 3 块泵控板烧同一份 [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino),仅修改顶部 `BOARD_ID` 即可区分。
 
 ### 9 状态机流程
 
@@ -154,7 +163,7 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 | `DEFLATE_ALL,b` | 全部 3 阀打开放气 b 秒 | 0 < b ≤ 30,否则 `ERR,<板号>,BAD_DURATION` |
 | `INFLATE_M` | 9 泵(本板 3 泵)同步点充,每泵独立时长(见 `INFLATE_M_MS_PER_PUMP`);Python 每秒广播一次刷新 | — |
 | `STOP_ALL` | 立即停止全部 6 设备(模式互斥优先级最高) | — |
-| `STATUS` | 查询当前板状态 | 返回 `STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx` |
+| `STATUS` | 查询当前板状态 | 返回 `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` |
 | `TEST_PUMP,i,t` | 测试第 i 号泵(0..2),持续 t 秒 | 0 < t ≤ 5,否则 `ERR,<板号>,BAD_TEST_DURATION` |
 
 **泵控板响应**:
@@ -164,7 +173,7 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 | `READY,<板号>,<时长1>,<时长2>,<时长3>` | 上电就绪(5 字段:板号 + 本板三路 INFLATE_M_MS_PER_PUMP,用于与 `config.INFLATE_M_MS_PER_BOARD` 严格比对,不一致拒绝连接) |
 | `ACK,<板号>,<命令>` | 指令执行成功(如 `ACK,PUMP_A,INFLATE_ALL`) |
 | `ERR,<板号>,<原因>` | 指令拒绝/失败(原因:`BAD_DURATION` / `BAD_PUMP_INDEX` / `BAD_TEST_DURATION` / `BAD_ARGS` / `UNKNOWN_CMD`) |
-| `STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx` | 状态查询响应(mode ∈ IDLE/INFLATE_ALL/DEFLATE_ALL/INFLATE_M/TEST;relay/servo 为 6 位 0/1 位图,设备 0..5) |
+| `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` | 状态查询响应(mode ∈ IDLE/INFLATE_ALL/DEFLATE_ALL/INFLATE_M/TEST;relay/pwm 为 6 位 0/1 位图,设备 0..5) |
 
 > **READY 严格门禁(报告 10.2)**:`SERIAL_ENABLED=True` 时,`connect(expected_ready_params=config.INFLATE_M_MS_PER_BOARD[板号])` 会要求 Arduino 上电 READY 携带 5 字段,且三路时长与 Python 配置**完全相等**,否则拒绝进入运行态。此举拦截"PUMP_B 烧了 PUMP_A 参数"或"改了配置未重烧 Arduino"两类常见部署错误。灯箱 READY 仍为 2 字段(`READY,LIGHT`)。
 
@@ -177,7 +186,7 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 | `LIGHT_ALL_OFF` | 全部熄灭 |
 | `LIGHT_FLASH,3` | 三灯闪烁 3 次 |
 
-> **模式互斥(泵控板)**:同一时刻只能处于一个模式(IDLE / INFLATE_ALL / DEFLATE_ALL / INFLATE_M / TEST)。进入新指令前自动 `allOff()`(停止所有 RC 脉冲 + 断开所有继电器),再启动新模式。
+> **模式互斥(泵控板)**:同一时刻只能处于一个模式(IDLE / INFLATE_ALL / DEFLATE_ALL / INFLATE_M / TEST)。进入新指令前自动 `allOff()`(紧急停止:断开所有继电器 + PWM=0),再启动新模式。
 >
 > **INFLATE_M 时序**:Python 每秒广播一次 `INFLATE_M`,每次广播重启所有 3 泵周期。每泵按 `INFLATE_M_MS_PER_PUMP[i]` 独立计时(均 ≤ 1000ms),到时自动停泵。本地看门狗 `INFLATE_M_LOCAL_TIMEOUT_MS=1500ms`:若 1500ms 内未收到新 `INFLATE_M`,强制停止所有泵(防 Python 卡死)。
 
@@ -185,7 +194,12 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 
 完整的 Arduino 代码(含详细注释)见 [arduino_commands/](arduino_commands/) 目录:
 
-- [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino) — **★ 当前版本(v4.2)** 3 块泵控 UNO 共用源码。基于 RC 脉冲 + 继电器供电隔离模型,扩展至 3 泵 + 3 阀 = 6 设备。烧录前修改顶部 `BOARD_ID` 为 `PUMP_A` / `PUMP_B` / `PUMP_C`,以及 `INFLATE_M_MS_PER_PUMP[3]`(每泵吸气时长,实物标定后修改)
+- [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino) — **★ 当前版本(v4.3)** 3 块泵控 UNO 共用源码。基于**占空比 PWM + 继电器供电隔离**模型,扩展至 3 泵 + 3 阀 = 6 设备。烧录前必须修改:
+  - `BOARD_ID`:`PUMP_A` / `PUMP_B` / `PUMP_C`
+  - `INFLATE_M_MS_PER_PUMP[3]`:本板 3 个泵的实测吸气时长(毫秒,≤ 1000)
+  - `VALVE_ENERGIZED_MEANS_OPEN`:★ **必须由实物实测确定**(报告 c15a9b0 P0)
+  - `RELAY_ACTIVE_LOW`:实测继电器触发电平
+- [pump_uno_single_board_test/pump_uno_single_board_test.ino](arduino_commands/pump_uno_single_board_test/pump_uno_single_board_test.ino) — **★ v1.0 单板泵阀联合测试固件**(报告 11.x)。无需 Python 主程序即可在 Arduino 串口监视器手动验证继电器、PWM S 线、阀状态、泵停止。提供 `ARM` / `TEST_RELAY` / `TEST_SIGNAL` / `VALVE_OPEN` / `INFLATE_CHANNEL` / `STOP_PUMPS` / `SAFE_VENT` 等命令,单次测试硬上限 2000ms。**联调前必须先用此固件完成报告 12.2~12.5 各阶段验证**
 - [pump_uno_commands.txt](arduino_commands/pump_uno_commands.txt) — **(旧版 v4.1,已废弃)** 单板单泵控继电器模型参考代码。仅供历史对照,新项目请使用 `pump_uno_v4_2.ino`
 - [lightbox_uno_v4_2/lightbox_uno_v4_2.ino](arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino) — **★ 当前版本(v4.2.1)** 灯箱 UNO 独立可编译 sketch,非阻塞闪烁状态机(报告 7.1)。可直接用 Arduino IDE 打开上传,无需从 .txt 复制粘贴
 - [lightbox_uno_commands.txt](arduino_commands/lightbox_uno_commands.txt) — 灯箱 UNO 说明文档(接线/协议/参数),固件代码已拆到上述 .ino
@@ -194,9 +208,17 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 
 1. 用 Arduino IDE 打开 `pump_uno_v4_2.ino`,修改顶部 `BOARD_ID` 为 `PUMP_A`
 2. 修改 `INFLATE_M_MS_PER_PUMP[3]` 为本板 3 个泵的实测吸气时长(毫秒,≤ 1000)
-3. 上传至第 1 块 UNO;重复步骤 1-3,改 `BOARD_ID` 为 `PUMP_B` / `PUMP_C` 后分别上传至第 2、3 块 UNO
-4. 用 Arduino IDE 打开 `arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino`,上传至第 4 块 UNO(灯箱);`lightbox_uno_commands.txt` 仅供接线/参数说明参考,无需复制代码
-5. 在 Windows 设备管理器中确认 4 个 COM 口编号,更新 [config.py](config.py) 的 `PUMP_BOARDS` 与 `LIGHT_SERIAL_PORT`
+3. ★ 实测确认继电器触发电平与阀通电语义,相应修改 `RELAY_ACTIVE_LOW` 与 `VALVE_ENERGIZED_MEANS_OPEN`(详见报告 c15a9b0 7.2 / 8.3)
+4. 上传至第 1 块 UNO;重复步骤 1-3,改 `BOARD_ID` 为 `PUMP_B` / `PUMP_C` 后分别上传至第 2、3 块 UNO
+5. 用 Arduino IDE 打开 `arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino`,上传至第 4 块 UNO(灯箱);`lightbox_uno_commands.txt` 仅供接线/参数说明参考,无需复制代码
+6. 在 Windows 设备管理器中确认 4 个 COM 口编号,更新 [config.py](config.py) 的 `PUMP_BOARDS` 与 `LIGHT_SERIAL_PORT`
+
+> ★ **联调前必须先用单板测试固件验证**(报告 12.x):用 `pump_uno_single_board_test.ino` 烧到 1 块 UNO 上,通过 Arduino 串口监视器手动执行 `ARM` → `TEST_RELAY,0,300` → `TEST_SIGNAL,0,0,255,300` → `INFLATE_CHANNEL,0,300`,逐项验证:
+> - STOP 后继电器实际断电(报告 7.2 验收点)
+> - COM/NO 待机为 0V,运行期间为额定电压(万用表测)
+> - 充气时阀不会同时放气(VALVE_ENERGIZED_MEANS_OPEN 配置正确)
+> - 拔 USB 后泵不会持续运行(硬断电有效)
+> 全部通过后才允许烧录正式固件并接入 Python 主程序。
 
 ## 33 个关键点编号对照表
 
@@ -262,7 +284,7 @@ MediaPipe Pose 输出 33 个关键点,坐标归一化到 [0, 1]:
 | `SERIAL_WRITE_TIMEOUT` | `0.5` | 写超时(秒,防卡死) |
 | `PUMP_BOARDS` | (见下表) | 3 块泵控 UNO 配置(板 ID + COM 口) |
 | `LIGHT_SERIAL_PORT` | `"COM4"` | 灯箱 UNO 串口 |
-| `INFLATE_M_MS_PER_BOARD` | (见下表) | 9 泵 INFLATE_M 时长(毫秒,仅供 Python 端记录;每板 UNO 本地硬编码) |
+| `INFLATE_M_MS_PER_BOARD` | (见下表) | 9 泵 INFLATE_M 时长(毫秒;`SERIAL_ENABLED=True` 时作为 READY 严格门禁期望值,与 Arduino 上电 READY 三路时长逐板比对,不一致拒绝连接) |
 | `SAFE_STOP_DEFLATE_TIME` | `5.0` | SAFE_STOP 态强制放气秒数 |
 
 `PUMP_BOARDS` 默认配置(★ COM 口为占位,实机以设备管理器为准):
@@ -304,7 +326,9 @@ mediapipe_pose_py/
 │   ├── state_machine.py        # 9 状态有限状态机(含 SAFE_STOP,核心)
 │   └── serial_sender.py        # PumpSender / PumpGroupSender / LightSender
 ├── arduino_commands/           # Arduino 参考代码(不被 Python 执行)
-│   ├── pump_uno_v4_2.ino       # ★ v4.2 泵控 UNO 源码(3 板共用,改 BOARD_ID)
+│   ├── pump_uno_v4_2.ino       # ★ v4.3 泵控 UNO 源码(3 板共用,改 BOARD_ID)
+│   ├── pump_uno_single_board_test/  # ★ v1.0 单板泵阀联合测试固件(联调前验证)
+│   │   └── pump_uno_single_board_test.ino
 │   ├── pump_uno_commands.txt   # (旧版 v4.1,已废弃)单板泵控参考
 │   ├── lightbox_uno_v4_2/      # ★ v4.2.1 灯箱 UNO 独立 sketch 目录
 │   │   └── lightbox_uno_v4_2.ino # 非阻塞闪烁固件(可直接编译上传)
@@ -314,7 +338,9 @@ mediapipe_pose_py/
 └── docs/
     ├── ARCHITECTURE.md         # 架构说明
     ├── KEYPOINTS.md            # 33 关键点编号对照表
-    └── TROUBLESHOOTING.md      # 常见问题排查
+    ├── TROUBLESHOOTING.md      # 常见问题排查
+    └── history/                # 历史复查报告归档
+        └── (按提交哈希归档)
 ```
 
 ## FAQ(常见问题)

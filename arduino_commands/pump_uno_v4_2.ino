@@ -1,20 +1,33 @@
 /* =====================================================================
- * 气泵控制 Uno (v4.2) - 3 泵 + 3 阀 = 6 设备
+ * 气泵控制 Uno (v4.3) - 3 泵 + 3 阀 = 6 设备
  *
  * 同一份代码烧录到 3 块 UNO(PUMP_A/B/C),只需修改下方 BOARD_ID
  *
- * 硬件模型(v4.1): RC 脉冲 + 继电器供电隔离
- *   - 每台设备(泵/阀)占用 1 路继电器(供电通断) + 1 路 S 线(RC 脉冲)
- *   - 继电器闭合 → 设备得电;Servo 输出 RC 脉冲 → 控制设备启停
- *   - 上电默认:继电器断开(RELAY_ACTIVE_LOW 时输出 HIGH),无 RC 脉冲
+ * ★ v4.3 关键变更(实机复查报告 c15a9b0):
+ *   1. 弃用 <Servo.h> + writeMicroseconds(RC 脉冲),
+ *      改用 analogWrite() 占空比 PWM(用户已确认电子开关为 PWM 类型)。
+ *   2. 引脚重分配:6 路 S 信号全部位于 UNO 硬件 PWM 引脚(D3/5/6/9/10/11),
+ *      继电器改用非 PWM 数字引脚(D2/4/7/8/12/13)。
+ *   3. 新增 VALVE_ENERGIZED_MEANS_OPEN 配置,把"通电"和"阀开"语义解耦,
+ *      修复"充气时电磁阀同时放气"的 P0 问题。
+ *   4. 区分 normalPumpOff / emergencyPumpOff:
+ *      正常停止先保持 PWM OFF 帧 PWM_OFF_HOLD_MS 再断继电器,
+ *      紧急停止立即断继电器 + PWM=0(安全优先)。
+ *   5. 严格数值解析:parseStrictUInt / parseStrictFloatSeconds 替代 toInt/toFloat,
+ *      拒绝 "5.0abc" 等畸形输入(报告 10.2)。
+ *
+ * 硬件模型(v4.3): 占空比 PWM + 继电器供电隔离
+ *   - 每台设备(泵/阀)占用 1 路继电器(供电通断)+ 1 路 PWM S 线(启停信号)
+ *   - 继电器闭合 → 设备得电;analogWrite(PWM_ON_DUTY) → 启动
+ *   - 上电默认:继电器断开(RELAY_ACTIVE_LOW 时输出 HIGH),PWM=0
  *
  * 设备映射(CHANNEL_COUNT=3,泵/阀交错排列):
- *   索引 0: 泵1  (D2 继电器 + D8  S 线)
- *   索引 1: 阀1  (D3 继电器 + D9  S 线)
- *   索引 2: 泵2  (D4 继电器 + D10 S 线)
- *   索引 3: 阀2  (D5 继电器 + D11 S 线)
- *   索引 4: 泵3  (D6 继电器 + D12 S 线)
- *   索引 5: 阀3  (D7 继电器 + D13 S 线)
+ *   索引 0: 泵1  (D2  继电器 + D3  PWM)
+ *   索引 1: 阀1  (D4  继电器 + D5  PWM)
+ *   索引 2: 泵2  (D7  继电器 + D6  PWM)
+ *   索引 3: 阀2  (D8  继电器 + D9  PWM)
+ *   索引 4: 泵3  (D12 继电器 + D10 PWM)
+ *   索引 5: 阀3  (D13 继电器 + D11 PWM)
  *
  * 串口协议(9600 baud,每行一条,以 '\n' 结尾):
  *   INFLATE_ALL,a    全部 3 泵充气 a 秒(0 < a <= 30)
@@ -32,10 +45,8 @@
  *                       用于 Python 端核对烧录参数是否与标定表一致)
  *   ACK,<板号>,<命令>                  指令执行成功
  *   ERR,<板号>,<原因>                  指令拒绝/失败
- *   STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx
+ *   STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx
  * ===================================================================== */
-
-#include <Servo.h>
 
 /* =====================================================================
  * ★★★ 用户可调参数区(在 Arduino IDE 中修改此处即可)★★★
@@ -48,23 +59,46 @@ const char BOARD_ID[] = "PUMP_A";
 // ---- 通道数(每板 3 泵 + 3 阀,固定为 3)----
 const int CHANNEL_COUNT = 3;
 
-// ---- 引脚映射(6 设备交错:泵/阀/泵/阀/泵/阀)----
+// ---- 引脚映射(v4.3:PWM 全部走硬件 PWM 引脚 D3/5/6/9/10/11)----
 // 设备索引 i (i=0..5):
-//   偶数 i = 泵(i/2 + 1),对应 RELAY_PINS[i] / SERVO_PINS[i]
-//   奇数 i = 阀(i/2 + 1),对应 RELAY_PINS[i] / SERVO_PINS[i]
-const int RELAY_PINS[6] = {2, 3, 4, 5, 6, 7};        // 继电器引脚 D2-D7
-const int SERVO_PINS[6] = {8, 9, 10, 11, 12, 13};   // S 线引脚   D8-D13
+//   偶数 i = 泵(i/2 + 1)
+//   奇数 i = 阀(i/2 + 1)
+// 注意:RELAY_PINS 必须全部为非 PWM 数字引脚,
+//       PWM_PINS 必须全部为 UNO 硬件 PWM 引脚(3/5/6/9/10/11)。
+const int RELAY_PINS[6] = {2, 4, 7, 8, 12, 13};      // 继电器引脚(非 PWM)
+const int PWM_PINS[6]   = {3, 5, 6, 9, 10, 11};      // S 线 PWM 引脚(硬件 PWM)
 
 // ---- 继电器触发电平 ----
 // true  -> 输出 LOW 时继电器闭合(常见 5V 继电器模块)
 // false -> 输出 HIGH 时继电器闭合
+// ★ 必须用万用表实测:待机时 COM+NO 应为断路
 const bool RELAY_ACTIVE_LOW = true;
 
-// ---- RC 脉冲参数(微秒)----
-// Servo.writeMicroseconds() 输出 1000-2000us 周期脉冲
-// 1500us = 中性(停止),2000us = 正向启动
-const int RC_PULSE_OFF_US = 1500;
-const int RC_PULSE_ON_US  = 2000;
+// ---- ★ 阀通电语义(报告 8.4:必须由实物实测确定)★ ----
+// true  -> 阀通电 = 排气口打开(放气);断电 = 关闭气路(保持气体)
+// false -> 阀通电 = 关闭气路(保持气体);断电 = 排气口打开(放气)
+// 实测方法:断开阀控制信号,只通电/断电继电器,观察气路状态
+// 当前默认值 = true(继电器通电时阀打开排气)。
+// 若实测发现"断电时阀放气",改为 false。
+const bool VALVE_ENERGIZED_MEANS_OPEN = true;
+
+// ---- PWM 占空比参数(0..255)----
+// PWM_ON_DUTY  = 启动设备(满占空比 255)
+// PWM_OFF_DUTY = 停止设备(零占空比 0)
+// 若电子开关需要特定阈值(如 ≥200 才识别为 ON),在此调整
+const int PWM_ON_DUTY  = 255;
+const int PWM_OFF_DUTY = 0;
+
+// ---- PWM OFF 帧保持时长(报告 7.3:替代旧版 delay(5))----
+// 正常停止时先写 PWM_OFF_DUTY 并保持该时长,确保电子开关
+// 收到完整 OFF 帧再断继电器。5ms 太短不足一帧;50ms 较稳妥。
+// 实测后可调小但不应小于 20ms。
+const unsigned long PWM_OFF_HOLD_MS = 50;
+
+// ---- 阀切换稳定时间(报告 8.4)----
+// 关闭阀 → 等待 VALVE_SETTLE_MS → 启动泵(避免充气瞬间阀仍在放气)
+// 默认 30ms,实测后调整(机械阀响应较慢可加大到 80ms)
+const unsigned long VALVE_SETTLE_MS = 30;
 
 /* ---------------------------------------------------------------------
  * ★ INFLATE_M 每泵独立吸气时长(毫秒)★
@@ -108,8 +142,9 @@ enum Mode {
 Mode currentMode = MODE_IDLE;
 
 // ---- 运行时变量 ----
-Servo servos[6];                       // 6 个 Servo 对象(对应 6 设备)
-bool servoAttached[6] = {false, false, false, false, false, false};
+// PWM 不需要 attach/detach,只需记录当前每路 PWM 值
+int pwmDuty[6] = {0, 0, 0, 0, 0, 0};           // 6 路 PWM 当前占空比
+bool relayClosed[6] = {false, false, false, false, false, false};
 
 // 起始时刻 + 持续时长(用 millis() 差值判断超时,防回绕)
 unsigned long inflateAllStartTime = 0;
@@ -153,6 +188,66 @@ inline bool elapsedSince(unsigned long start, unsigned long duration) {
 }
 
 /**
+ * parseStrictUInt - 严格无符号整数解析(报告 10.2)
+ *
+ * 与 String.toInt() 不同:任一非数字字符返回 false,
+ * 拒绝 "12abc" / "" / "-5" / "3.5" 等畸形输入。
+ *
+ * @param text  输入字符串
+ * @param value 输出解析结果(仅当返回 true 时有效)
+ * @return true 解析成功;false 输入非法
+ */
+bool parseStrictUInt(const String &text, unsigned long &value) {
+  if (text.length() == 0) return false;
+  unsigned long result = 0;
+  for (unsigned int i = 0; i < text.length(); i++) {
+    char c = text.charAt(i);
+    if (c < '0' || c > '9') return false;
+    result = result * 10UL + (unsigned long)(c - '0');
+  }
+  value = result;
+  return true;
+}
+
+/**
+ * parseStrictFloatSeconds - 严格浮点秒解析(报告 10.2)
+ *
+ * 允许格式:[0-9]+(.[0-9]*)? 或 [0-9]*.[0-9]+
+ * 拒绝 "5.0abc" / "" / "." / "5.5.5" / "-1.0"
+ *
+ * @param text  输入字符串
+ * @param value 输出秒数(仅当返回 true 时有效)
+ * @return true 解析成功;false 输入非法
+ */
+bool parseStrictFloatSeconds(const String &text, float &value) {
+  if (text.length() == 0) return false;
+  bool seenDot = false;
+  bool seenDigit = false;
+  unsigned long intPart = 0;
+  float fracVal = 0.0;
+  float divisor = 10.0;
+  for (unsigned int i = 0; i < text.length(); i++) {
+    char c = text.charAt(i);
+    if (c >= '0' && c <= '9') {
+      seenDigit = true;
+      if (!seenDot) {
+        intPart = intPart * 10UL + (unsigned long)(c - '0');
+      } else {
+        fracVal += (float)(c - '0') / divisor;
+        divisor *= 10.0;
+      }
+    } else if (c == '.' && !seenDot) {
+      seenDot = true;
+    } else {
+      return false;  // 非法字符
+    }
+  }
+  if (!seenDigit) return false;  // "." 不合法
+  value = (float)intPart + fracVal;
+  return true;
+}
+
+/**
  * setRelay - 控制单个继电器供电通断
  * @param deviceIdx 设备索引(0..5)
  * @param on true=供电(继电器闭合),false=断电(继电器断开)
@@ -165,69 +260,110 @@ void setRelay(int deviceIdx, bool on) {
   } else {
     digitalWrite(pin, on ? HIGH : LOW);
   }
+  relayClosed[deviceIdx] = on;
 }
 
 /**
- * setServoPulse - 输出 RC 脉冲控制设备启停
+ * setPwm - 写 PWM 占空比到 S 线引脚
  * @param deviceIdx 设备索引(0..5)
- * @param on true=启动(RC_PULSE_ON_US),false=停止(RC_PULSE_OFF_US)
+ * @param duty      占空比(0..255)
  *
- * 首次调用时 attach Servo 到对应引脚(占用 timer1 资源)
+ * v4.3:替代旧版 setServoPulse/writeMicroseconds。
+ * analogWrite 在硬件 PWM 引脚上输出 ~490Hz(D5/D6 约 980Hz)方波。
  */
-void setServoPulse(int deviceIdx, bool on) {
+void setPwm(int deviceIdx, int duty) {
   if (deviceIdx < 0 || deviceIdx >= 6) return;
-  if (!servoAttached[deviceIdx]) {
-    servos[deviceIdx].attach(SERVO_PINS[deviceIdx]);
-    servoAttached[deviceIdx] = true;
-  }
-  servos[deviceIdx].writeMicroseconds(on ? RC_PULSE_ON_US : RC_PULSE_OFF_US);
+  analogWrite(PWM_PINS[deviceIdx], duty);
+  pwmDuty[deviceIdx] = duty;
 }
 
 /**
- * stopServo - 停止 RC 脉冲并 detach(释放定时器资源)
- */
-void stopServo(int deviceIdx) {
-  if (deviceIdx < 0 || deviceIdx >= 6) return;
-  if (servoAttached[deviceIdx]) {
-    servos[deviceIdx].detach();
-    servoAttached[deviceIdx] = false;
-  }
-}
-
-/**
- * deviceOn - 启动单台设备:闭合继电器 + 启动 RC 脉冲
+ * deviceOn - 启动单台设备:闭合继电器 + 输出 PWM_ON_DUTY
  */
 void deviceOn(int deviceIdx) {
   setRelay(deviceIdx, true);
-  setServoPulse(deviceIdx, true);
+  setPwm(deviceIdx, PWM_ON_DUTY);
 }
 
 /**
- * deviceOff - 停止单台设备:停止 RC 脉冲 + 断开继电器
+ * normalPumpOff - 正常停止:先 PWM OFF 保持 PWM_OFF_HOLD_MS,再断继电器
  *
- * 顺序:先停止 RC 脉冲 -> 短暂保持让设备停稳 -> 断电 -> detach
- * 避免继电器断电瞬间电弧/反电动势损坏设备
+ * 报告 7.3:旧版 delay(5) 不足一帧,电子开关可能未收到 OFF 帧。
+ * 新版保持 PWM_OFF_HOLD_MS(默认 50ms)确保 OFF 帧完整发送。
  */
-void deviceOff(int deviceIdx) {
-  setServoPulse(deviceIdx, false);
-  stopServo(deviceIdx);
+void normalPumpOff(int deviceIdx) {
+  setPwm(deviceIdx, PWM_OFF_DUTY);
+  delay(PWM_OFF_HOLD_MS);   // 保持 OFF 帧,让电子开关确实停止
   setRelay(deviceIdx, false);
 }
 
 /**
- * allOff - 全部 6 台设备停止 + 继电器断开
+ * emergencyPumpOff - 紧急停止:立即断继电器 + PWM=0
+ *
+ * 安全优先:不等待 PWM_OFF_HOLD_MS,直接断电。
+ * 用于 STOP_ALL / SAFE_STOP / 通信失联等紧急场景。
+ */
+void emergencyPumpOff(int deviceIdx) {
+  setRelay(deviceIdx, false);   // 硬断电优先
+  setPwm(deviceIdx, PWM_OFF_DUTY);
+}
+
+/**
+ * deviceOff - 停止单台设备(通用接口,内部走正常停止)
+ *
+ * 用于模式切换/到时自动停止等正常场景。
+ * STOP_ALL 路径应直接调用 emergencyPumpOff 而非本函数。
+ */
+void deviceOff(int deviceIdx) {
+  normalPumpOff(deviceIdx);
+}
+
+/**
+ * setValveOpen - 阀控制语义化抽象(报告 8.4)
+ *
+ * @param channel 通道索引(0..2)
+ * @param open    true=打开排气阀(放气),false=关闭排气阀(保持气体)
+ *
+ * 根据 VALVE_ENERGIZED_MEANS_OPEN 配置自动映射:
+ *   - true  (通电=排气):  open=true  -> deviceOn;  open=false -> deviceOff
+ *   - false (通电=关闭):  open=true  -> deviceOff; open=false -> deviceOn
+ *
+ * 这层抽象解耦了"通电"和"阀开",修复旧版"充气时阀仍在放气"问题。
+ */
+void setValveOpen(int channel, bool open) {
+  int device = valveToDevice(channel);
+  bool energize = VALVE_ENERGIZED_MEANS_OPEN ? open : !open;
+  if (energize) {
+    deviceOn(device);
+  } else {
+    deviceOff(device);
+  }
+}
+
+/**
+ * setPumpRunning - 泵控制语义化抽象
+ *
+ * @param channel 通道索引(0..2)
+ * @param running true=启动泵,false=停止泵
+ */
+void setPumpRunning(int channel, bool running) {
+  int device = pumpToDevice(channel);
+  if (running) {
+    deviceOn(device);
+  } else {
+    deviceOff(device);
+  }
+}
+
+/**
+ * allOff - 全部 6 台设备停止 + 继电器断开(紧急停止语义)
  * 用于 STOP_ALL 指令、模式切换前清理、上电初始化
+ *
+ * 报告 7.3:统一走 emergencyPumpOff,确保硬件断电优先
  */
 void allOff() {
-  // 先停止所有 RC 脉冲(让设备停稳)
   for (int i = 0; i < 6; i++) {
-    setServoPulse(i, false);
-  }
-  delay(5);  // 短暂保持脉冲让设备停稳
-  // 然后断开所有继电器并 detach
-  for (int i = 0; i < 6; i++) {
-    stopServo(i);
-    setRelay(i, false);
+    emergencyPumpOff(i);
   }
   // 清除所有模式标志
   inflatingAll = false;
@@ -245,7 +381,7 @@ void allOff() {
  * 不合法返回 false(reject,不 clamp)
  */
 inline bool validateDuration(float seconds) {
-  return (seconds > 0.0) && (seconds <= MAX_DURATION_SEC);
+  return (seconds > 0.0f) && (seconds <= MAX_DURATION_SEC);
 }
 
 /**
@@ -280,15 +416,22 @@ void sendERR(const String &reason) {
 /**
  * startInflateAll - 全部 3 泵充气,持续 seconds 秒
  *
- * 流程:先断开所有阀(防气路冲突) -> 启动所有泵
+ * 流程(报告 8.4 修复):
+ *   1. 关闭所有排气阀(VALVE_ENERGIZED_MEANS_OPEN 自动映射极性)
+ *   2. 等待 VALVE_SETTLE_MS 让阀稳定
+ *   3. 启动所有泵
  */
 void startInflateAll(float seconds) {
   enterMode(MODE_INFLATE_ALL);
+  // 1. 关闭所有排气阀(防气路冲突)
   for (int i = 0; i < CHANNEL_COUNT; i++) {
-    deviceOff(valveToDevice(i));   // 断开阀
+    setValveOpen(i, false);
   }
+  // 2. 等阀稳定(避免充气瞬间阀仍在放气)
+  delay(VALVE_SETTLE_MS);
+  // 3. 启动所有泵
   for (int i = 0; i < CHANNEL_COUNT; i++) {
-    deviceOn(pumpToDevice(i));     // 启动泵
+    setPumpRunning(i, true);
   }
   inflateAllStartTime = millis();
   inflateAllDuration  = (unsigned long)(seconds * 1000);
@@ -296,17 +439,21 @@ void startInflateAll(float seconds) {
 }
 
 /**
- * startDeflateAll - 全部 3 阀打开(放气),持续 seconds 秒
+ * startDeflateAll - 全部 3 阀打开放气,持续 seconds 秒
  *
- * 流程:先断开所有泵(防气路冲突) -> 打开所有阀
+ * 流程:
+ *   1. 停止所有泵(正常停止:PWM OFF 保持 → 断继电器)
+ *   2. 打开所有排气阀(VALVE_ENERGIZED_MEANS_OPEN 自动映射)
  */
 void startDeflateAll(float seconds) {
   enterMode(MODE_DEFLATE_ALL);
+  // 1. 停止所有泵
   for (int i = 0; i < CHANNEL_COUNT; i++) {
-    deviceOff(pumpToDevice(i));    // 断开泵
+    setPumpRunning(i, false);
   }
+  // 2. 打开所有排气阀
   for (int i = 0; i < CHANNEL_COUNT; i++) {
-    deviceOn(valveToDevice(i));    // 打开阀
+    setValveOpen(i, true);
   }
   deflateAllStartTime = millis();
   deflateAllDuration  = (unsigned long)(seconds * 1000);
@@ -317,8 +464,8 @@ void startDeflateAll(float seconds) {
  * startInflateM - 9 泵同步点充(本板 3 泵),每泵独立时长
  *
  * 行为:
- *   - 首次进入(currentMode != MODE_INFLATE_M):allOff + 断开所有阀 + 启动 3 泵
- *   - 已在 INFLATE_M 模式(刷新):仅重启 3 泵周期(不断阀,因为阀已断开)
+ *   - 首次进入(currentMode != MODE_INFLATE_M):allOff + 关闭所有阀 + 启动 3 泵
+ *   - 已在 INFLATE_M 模式(刷新):仅重启 3 泵周期(不断阀,因为阀已关闭)
  *
  * 每泵各自计时,到时自动停泵;Python 每秒广播一次重启周期
  * 本地看门狗:INFLATE_M_LOCAL_TIMEOUT_MS(1500ms)无刷新则全停
@@ -326,14 +473,16 @@ void startDeflateAll(float seconds) {
 void startInflateM() {
   if (currentMode != MODE_INFLATE_M) {
     enterMode(MODE_INFLATE_M);
-    // 进入新周期:断开所有阀(防气路冲突)
+    // 进入新周期:关闭所有排气阀(防气路冲突)
     for (int i = 0; i < CHANNEL_COUNT; i++) {
-      deviceOff(valveToDevice(i));
+      setValveOpen(i, false);
     }
+    // 等阀稳定
+    delay(VALVE_SETTLE_MS);
   }
   // 每收到 INFLATE_M(无论首次还是刷新)都重启所有泵周期
   for (int i = 0; i < CHANNEL_COUNT; i++) {
-    deviceOn(pumpToDevice(i));
+    setPumpRunning(i, true);
     inflateMPumpStart[i]  = millis();
     inflateMPumpActive[i] = true;
   }
@@ -358,8 +507,10 @@ bool testPump(int pumpIdx, float seconds) {
     return false;
   }
   enterMode(MODE_TEST);
-  deviceOff(valveToDevice(pumpIdx));   // 断开对应阀
-  deviceOn(pumpToDevice(pumpIdx));    // 启动对应泵
+  // 关闭对应阀,等阀稳定,再启动泵(报告 8.4 语义)
+  setValveOpen(pumpIdx, false);
+  delay(VALVE_SETTLE_MS);
+  setPumpRunning(pumpIdx, true);
   testStartTime = millis();
   testDuration  = (unsigned long)(seconds * 1000);
   testingPump = true;
@@ -368,8 +519,9 @@ bool testPump(int pumpIdx, float seconds) {
 
 /**
  * sendStatus - 回复当前板状态
- * 格式: STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx
- *   relay/servo 位图:6 字符,从设备 0 到设备 5,1=闭合/已 attach,0=断开/未 attach
+ * 格式: STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx
+ *   relay 位图:6 字符,1=闭合,0=断开
+ *   pwm  位图:6 字符,1=ON(PWM_ON_DUTY),0=OFF
  */
 void sendStatus() {
   Serial.print("STATUS,");
@@ -384,13 +536,11 @@ void sendStatus() {
   }
   Serial.print(",relay=");
   for (int i = 0; i < 6; i++) {
-    int s = digitalRead(RELAY_PINS[i]);
-    bool closed = RELAY_ACTIVE_LOW ? (s == LOW) : (s == HIGH);
-    Serial.print(closed ? "1" : "0");
+    Serial.print(relayClosed[i] ? "1" : "0");
   }
-  Serial.print(",servo=");
+  Serial.print(",pwm=");
   for (int i = 0; i < 6; i++) {
-    Serial.print(servoAttached[i] ? "1" : "0");
+    Serial.print(pwmDuty[i] == PWM_ON_DUTY ? "1" : "0");
   }
   Serial.println();
 }
@@ -401,7 +551,7 @@ void sendStatus() {
  * setup - 上电初始化
  *
  * 继电器引脚设为输出,默认按 RELAY_ACTIVE_LOW 计算断开电平
- * Servo 引脚不主动 attach(节省 timer1 资源,需要时才 attach)
+ * PWM 引脚设为输出,默认 PWM_OFF_DUTY(0)
  */
 void setup() {
   Serial.begin(9600);
@@ -409,6 +559,13 @@ void setup() {
   for (int i = 0; i < 6; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], RELAY_ACTIVE_LOW ? HIGH : LOW);
+    relayClosed[i] = false;
+  }
+  // PWM 引脚默认输出 0(停止)
+  for (int i = 0; i < 6; i++) {
+    pinMode(PWM_PINS[i], OUTPUT);
+    analogWrite(PWM_PINS[i], PWM_OFF_DUTY);
+    pwmDuty[i] = PWM_OFF_DUTY;
   }
   allOff();  // 清除所有运行时标志(双重保险)
   // 上电就绪:回送本板 ID + 3 泵点充时长(用于 Python 端核对烧录参数)
@@ -440,7 +597,7 @@ void loop() {
       sendStatus();
 
     } else if (line == "STOP_ALL") {
-      allOff();
+      allOff();   // 紧急停止语义
       sendACK("STOP_ALL");
 
     } else if (line == "INFLATE_M") {
@@ -450,8 +607,10 @@ void loop() {
 
     } else if (line.startsWith("INFLATE_ALL,")) {
       // INFLATE_ALL,a  (前缀 "INFLATE_ALL," 长 12)
-      float a = line.substring(12).toFloat();
-      if (!validateDuration(a)) {
+      float a;
+      if (!parseStrictFloatSeconds(line.substring(12), a)) {
+        sendERR("BAD_DURATION");
+      } else if (!validateDuration(a)) {
         sendERR("BAD_DURATION");
       } else {
         startInflateAll(a);
@@ -460,8 +619,10 @@ void loop() {
 
     } else if (line.startsWith("DEFLATE_ALL,")) {
       // DEFLATE_ALL,b  (前缀 "DEFLATE_ALL," 长 12)
-      float b = line.substring(12).toFloat();
-      if (!validateDuration(b)) {
+      float b;
+      if (!parseStrictFloatSeconds(line.substring(12), b)) {
+        sendERR("BAD_DURATION");
+      } else if (!validateDuration(b)) {
         sendERR("BAD_DURATION");
       } else {
         startDeflateAll(b);
@@ -474,12 +635,19 @@ void loop() {
       if (firstComma < 0) {
         sendERR("BAD_ARGS");
       } else {
-        int pumpIdx   = line.substring(10, firstComma).toInt();
-        float seconds = line.substring(firstComma + 1).toFloat();
-        if (testPump(pumpIdx, seconds)) {
-          sendACK("TEST_PUMP");
+        unsigned long pumpIdxUL;
+        float seconds;
+        if (!parseStrictUInt(line.substring(10, firstComma), pumpIdxUL)) {
+          sendERR("BAD_PUMP_INDEX");
+        } else if (!parseStrictFloatSeconds(line.substring(firstComma + 1), seconds)) {
+          sendERR("BAD_TEST_DURATION");
+        } else {
+          int pumpIdx = (int)pumpIdxUL;
+          if (testPump(pumpIdx, seconds)) {
+            sendACK("TEST_PUMP");
+          }
+          // 失败时 testPump 内部已发 ERR
         }
-        // 失败时 testPump 内部已发 ERR
       }
 
     } else {
@@ -492,16 +660,16 @@ void loop() {
   // 全充气到期
   if (inflatingAll && elapsedSince(inflateAllStartTime, inflateAllDuration)) {
     for (int i = 0; i < CHANNEL_COUNT; i++) {
-      deviceOff(pumpToDevice(i));
+      setPumpRunning(i, false);
     }
     inflatingAll = false;
     currentMode = MODE_IDLE;
   }
 
-  // 全放气到期
+  // 全放气到期:关闭所有阀(保持气体)
   if (deflatingAll && elapsedSince(deflateAllStartTime, deflateAllDuration)) {
     for (int i = 0; i < CHANNEL_COUNT; i++) {
-      deviceOff(valveToDevice(i));
+      setValveOpen(i, false);
     }
     deflatingAll = false;
     currentMode = MODE_IDLE;
@@ -512,7 +680,7 @@ void loop() {
     for (int i = 0; i < CHANNEL_COUNT; i++) {
       if (inflateMPumpActive[i] &&
           elapsedSince(inflateMPumpStart[i], INFLATE_M_MS_PER_PUMP[i])) {
-        deviceOff(pumpToDevice(i));
+        setPumpRunning(i, false);
         inflateMPumpActive[i] = false;
       }
     }
@@ -520,7 +688,7 @@ void loop() {
     if (elapsedSince(inflateMLastRefresh, INFLATE_M_LOCAL_TIMEOUT_MS)) {
       for (int i = 0; i < CHANNEL_COUNT; i++) {
         if (inflateMPumpActive[i]) {
-          deviceOff(pumpToDevice(i));
+          setPumpRunning(i, false);
           inflateMPumpActive[i] = false;
         }
       }
@@ -532,7 +700,7 @@ void loop() {
   // 测试到期
   if (testingPump && elapsedSince(testStartTime, testDuration)) {
     for (int i = 0; i < CHANNEL_COUNT; i++) {
-      deviceOff(pumpToDevice(i));
+      setPumpRunning(i, false);
     }
     testingPump = false;
     currentMode = MODE_IDLE;

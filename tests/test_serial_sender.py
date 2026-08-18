@@ -635,3 +635,107 @@ class TestReadyParamValidation:
             fake_serial_module, "READY,PUMP_A", [300, 500, 800],
         )
         assert ok is False
+
+
+# ============ 串口异常容错测试(报告 10.1) ============
+
+class BrokenSerial(FakeSerial):
+    """模拟 USB 拔出/in_waiting 抛异常的故障串口。
+
+    报告 10.1:真实 USB 串口突然拔出时,in_waiting 属性和 readline() 都可能
+    抛 SerialException/OSError。旧版 _send_all_and_collect 没有逐板
+    try/except,异常会冒泡中断整个广播方法。
+    """
+
+    def __init__(self, fail_on: str = "in_waiting") -> None:
+        super().__init__()
+        # fail_on: "in_waiting" 或 "readline"
+        self.fail_on: str = fail_on
+
+    @property
+    def in_waiting(self) -> int:
+        if self.fail_on == "in_waiting":
+            raise OSError("设备未连接 (模拟 USB 拔出)")
+        return super().in_waiting
+
+    def readline(self) -> bytes:
+        if self.fail_on == "readline":
+            raise OSError("读串口失败 (模拟 USB 拔出)")
+        return super().readline()
+
+
+class TestFairPollingExceptionHandling:
+    """报告 10.1:逐板 try/except 捕获串口异常,不影响其他板。
+
+    场景:
+    - PUMP_A 串口异常(in_waiting/readline 抛 OSError)
+    - PUMP_B/PUMP_C 正常返回 ACK
+    - 期望:A=False, B/C=True,方法不向主循环抛异常
+    """
+
+    def test_a_in_waiting_exception_bc_succeed(self) -> None:
+        """A 的 in_waiting 抛异常 → A=False,B/C 仍能收到 ACK。"""
+        group = make_auto_ack_group()
+        # PUMP_A 替换为 in_waiting 抛异常的故障串口
+        group.boards["PUMP_A"].serial_conn = BrokenSerial(fail_on="in_waiting")
+
+        results = group._send_all_and_collect(
+            "STOP_ALL",
+            accepted_commands={"STOP_ALL"},
+            response_timeout=0.5,
+        )
+        assert results["PUMP_A"] is False
+        assert results["PUMP_B"] is True
+        assert results["PUMP_C"] is True
+
+    def test_a_readline_exception_bc_succeed(self) -> None:
+        """A 的 readline 抛异常 → A=False,B/C 仍能收到 ACK。"""
+        group = make_auto_ack_group()
+        # PUMP_A 的 in_waiting 返回数据但 readline 抛异常
+        broken = BrokenSerial(fail_on="readline")
+        # AutoAckSerial 在 write 时已 feed ACK,但 readline 会抛异常
+        # 这里手动注入 ACK 到输入缓冲
+        broken.feed("ACK,PUMP_A,STOP_ALL\n")
+        # 替换 PUMP_A 的串口,write 走 BrokenSerial 父类(正常 feed ACK)
+        # 但 readline 抛异常
+        group.boards["PUMP_A"].serial_conn = broken
+
+        # 触发 write 后 broken 应已自动 feed ACK(经父类 write)
+        # 但 readline 会抛异常 → A 应被标记失败
+        results = group._send_all_and_collect(
+            "STOP_ALL",
+            accepted_commands={"STOP_ALL"},
+            response_timeout=0.5,
+        )
+        assert results["PUMP_A"] is False
+        assert results["PUMP_B"] is True
+        assert results["PUMP_C"] is True
+
+    def test_all_boards_exception_returns_all_false(self) -> None:
+        """三板 in_waiting 都抛异常 → 全部 False,方法不抛异常。"""
+        group = make_auto_ack_group()
+        for board_id in group.board_ids:
+            group.boards[board_id].serial_conn = BrokenSerial(fail_on="in_waiting")
+
+        results = group._send_all_and_collect(
+            "STOP_ALL",
+            accepted_commands={"STOP_ALL"},
+            response_timeout=0.3,
+        )
+        # 全部失败,但方法不抛异常
+        assert results == {"PUMP_A": False, "PUMP_B": False, "PUMP_C": False}
+
+    def test_exception_marks_sender_disconnected(self) -> None:
+        """串口异常后 sender._connected 应被标记为 False,后续不再尝试。"""
+        group = make_auto_ack_group()
+        group.boards["PUMP_A"].serial_conn = BrokenSerial(fail_on="in_waiting")
+
+        group._send_all_and_collect(
+            "STOP_ALL",
+            accepted_commands={"STOP_ALL"},
+            response_timeout=0.3,
+        )
+        assert group.boards["PUMP_A"].is_connected is False
+        # B/C 仍连接正常
+        assert group.boards["PUMP_B"].is_connected is True
+        assert group.boards["PUMP_C"].is_connected is True

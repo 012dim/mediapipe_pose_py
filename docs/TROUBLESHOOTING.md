@@ -199,6 +199,40 @@ pip install protobuf==3.20.3 --force-reinstall
 2. 修复硬件/连接后,按 `q` 退出程序
 3. 重新启动程序(SAFE_STOP 不能通过 `r` 重置,必须重启)
 
+### Q17.5:v4.3 实机联调前必须验证的 P0 项目(报告 c15a9b0)
+
+**背景**:上一轮实机测试发现"软件输出 DONE 后气泵仍运行"和"充气时电磁阀同时放气",根因是旧版固件假设电子开关为 RC Servo 脉冲、阀极性未配置。
+
+**联调前必须完成的验证步骤**(详见 README 烧录步骤与报告 12.x):
+
+1. **烧录单板测试固件** `arduino_commands/pump_uno_single_board_test/pump_uno_single_board_test.ino` 到 1 块 UNO
+2. **断开气泵动力负载**,只接 UNO + 继电器模块
+3. 在 Arduino IDE 串口监视器执行:
+   ```
+   ARM
+   TEST_RELAY,0,300       # 单独吸合继电器 0(泵1)300ms
+   TEST_SIGNAL,0,0,255,300  # 测试 PWM S 线:OFF→ON→OFF
+   ```
+4. **万用表测 COM/NO**:
+   - 待机/STOP:0V(否则继电器接错 NO/NC 或触发电平反)
+   - 运行期间:额定工作电压
+   - 到时后:回到 0V
+5. **确认 `VALVE_ENERGIZED_MEANS_OPEN` 极性**(报告 8.3):
+   - `VALVE_OPEN,0` 后观察气路是否打开排气
+   - 若不打开,改为 `false` 重新烧录
+6. **接气路但先不接气球**,执行 `INFLATE_CHANNEL,0,300`:
+   - 充气期间不应同时放气
+   - 到时后气泵物理停止
+7. 全部通过后才允许烧录正式固件 `pump_uno_v4_2.ino` 并接入 Python 主程序
+
+**关键判断**(报告 7.2):
+| STOP 后现象 | 判断 |
+|---|---|
+| 继电器灯灭,COM/NO 为 0V,气泵停止 | 正常,可继续联调 |
+| 继电器灯灭,但 COM/NO 仍有电 | 继电器接线或触点错误 |
+| COM/NO 为 0V,但气泵仍运行 | 气泵动力电源绕过继电器 |
+| STOP 有 ACK,但继电器灯仍亮 | `RELAY_ACTIVE_LOW` 配置反了 |
+
 ## 退出相关
 
 ### Q18:按 q 或 Ctrl+C 退出时有 Python 异常堆栈
@@ -252,11 +286,13 @@ cv2.destroyAllWindows()
 用 Arduino IDE 串口监视器(波特率 9600)发送指令并查看响应:
 ```
 发送: STATUS
-返回: STATUS,PUMP_A,mode=IDLE,relay=000000,servo=000000
+返回: STATUS,PUMP_A,mode=IDLE,relay=000000,pwm=000000
 
 发送: TEST_PUMP,0,1
 返回: ACK,PUMP_A,TEST_PUMP
 ```
+
+> ★ v4.3 引脚映射变更后,`relay` 与 `pwm` 位图对应的设备索引不变(0..5:泵1阀1泵2阀2泵3阀3),但物理引脚已重分配:`relay` 走 D2/4/7/8/12/13,`pwm` 走 D3/5/6/9/10/11。
 
 > 注意:READY 只在上电 `setup()` 阶段发送一次,格式为
 > `READY,PUMP_A,300,500,800`(5 字段:板号 + 三路点充时长)。

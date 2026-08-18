@@ -6,7 +6,7 @@
 
 项目采用 **分层 + 模块化** 架构,所有可调参数集中在 `config.py`,业务逻辑拆分到独立模块,`main.py` 仅负责组装与主循环。
 
-**v4.2 架构**:3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用 RC 脉冲 + 继电器供电隔离模型。
+**v4.3 架构**:3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用**占空比 PWM + 继电器供电隔离**模型(报告 c15a9b0:弃用 `<Servo.h>` RC 脉冲,改用 `analogWrite()` 硬件 PWM;新增 `VALVE_ENERGIZED_MEANS_OPEN` 阀极性配置解耦"通电"与"阀开"语义)。
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -162,7 +162,7 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 | `DEFLATE_ALL,b` | 全部 3 阀打开放气 b 秒 | 0 < b ≤ 30,否则 `ERR,<板号>,BAD_DURATION` |
 | `INFLATE_M` | 9 泵同步点充,每泵独立时长 | — |
 | `STOP_ALL` | 立即停止全部 6 设备(模式互斥优先级最高) | — |
-| `STATUS` | 查询当前板状态 | 返回 `STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx` |
+| `STATUS` | 查询当前板状态 | 返回 `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` |
 | `TEST_PUMP,i,t` | 测试第 i 号泵(0..2),持续 t 秒 | 0 < t ≤ 5 |
 
 ### 响应格式
@@ -172,7 +172,7 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 | `READY,<板号>,<点充时长1>,<点充时长2>,<点充时长3>` | 上电就绪(含本板 INFLATE_M_MS_PER_PUMP 数值,用于核对烧录参数) |
 | `ACK,<板号>,<命令>` | 指令执行成功 |
 | `ERR,<板号>,<原因>` | 指令拒绝/失败 |
-| `STATUS,<板号>,mode=...,relay=xxxxxx,servo=xxxxxx` | 状态查询响应 |
+| `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` | 状态查询响应(mode ∈ IDLE/INFLATE_ALL/DEFLATE_ALL/INFLATE_M/TEST;relay/pwm 为 6 位 0/1 位图,设备 0..5) |
 
 ### 灯箱(LIGHT, COM4)
 
@@ -207,8 +207,9 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 
 ### 7. 串口容错与板身份校验
 - `SERIAL_ENABLED=False`:测试模式,跳过所有串口发送,状态机正常流转
-- `SERIAL_ENABLED=True`:严格门禁,3 板泵控必须全部连接且 READY 板号匹配才进入运行态
+- `SERIAL_ENABLED=True`:严格门禁,3 板泵控必须全部连接且 **READY 板号和三路 INFLATE_M 时长均严格匹配**(`connect(expected_ready_params=config.INFLATE_M_MS_PER_BOARD[板号])`)才进入运行态
 - 任一泵控板发送失败 → 全组进入 SAFE_STOP(广播 STOP_ALL + 放气后等待退出)
+- 报告 10.1:公平轮询逐板 try/except 捕获 USB 拔出等串口异常,单板异常不影响其他板的 ACK 收集
 
 ### 8. SAFE_STOP 安全机制
 - 任一泵控板 `INFLATE_ALL` / `DEFLATE_ALL` / `INFLATE_M` 失败 → 进入 SAFE_STOP
@@ -220,6 +221,13 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 - **致命错误**(摄像头打不开、MediaPipe 初始化失败、泵控板未全连):退出码非 0
 - **可恢复错误**(推理异常、串口断开):警告并跳过,继续运行
 - **用户中断**(Ctrl+C、q):优雅退出,先 STOP_ALL 再关闭串口
+
+### 10. v4.3 PWM 重构与阀极性解耦(报告 c15a9b0 P0)
+- **弃用 RC 脉冲**:旧版 `Servo.writeMicroseconds(1500/2000)` 假设电子开关为 RC Servo 类型,实机证明为占空比 PWM;改用 `analogWrite(PWM_PINS[i], PWM_ON_DUTY/PWM_OFF_DUTY)`
+- **引脚重分配**:UNO 硬件 PWM 引脚仅 6 路(D3/5/6/9/10/11),全部用于 S 信号;继电器改用非 PWM 数字引脚(D2/4/7/8/12/13)
+- **阀极性配置**:`VALVE_ENERGIZED_MEANS_OPEN` 解耦"通电"与"阀开"语义,修复旧版"充气时阀仍放气"问题(★ 必须由实物实测确定)
+- **停止分级**:`normalPumpOff` 先保持 PWM OFF 帧 `PWM_OFF_HOLD_MS=50ms` 再断继电器;`emergencyPumpOff` 立即硬断电用于 STOP_ALL/SAFE_STOP
+- **严格数值解析**:`parseStrictUInt` / `parseStrictFloatSeconds` 替代 `toInt`/`toFloat`,拒绝畸形输入如 `"5.0abc"`(报告 P2)
 
 ## 扩展点
 

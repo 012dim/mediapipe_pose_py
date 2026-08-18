@@ -597,18 +597,41 @@ class PumpGroupSender:
                     results[board_id] = False
                     continue
 
-                in_waiting = getattr(conn, "in_waiting", 0)
-                if not in_waiting:
-                    continue  # 该板暂无数据,跳过让其他板有机会被读
+                # 报告 10.1:逐板 try/except 捕获 USB 拔出等串口异常,
+                # 防止单板异常导致整个 _send_all_and_collect 抛出,
+                # 让其他正常板仍能被收集到 ACK/ERR。
+                try:
+                    in_waiting = getattr(conn, "in_waiting", 0)
+                    if not in_waiting:
+                        continue  # 该板暂无数据,跳过让其他板有机会被读
+                    line = conn.readline()
+                except Exception as exc:  # noqa: BLE001
+                    # 生产环境可缩小到 serial.SerialException / OSError
+                    logger.error(
+                        "[PUMP_GROUP] %s 串口读取失败,标记失败并跳过: %s",
+                        board_id, exc,
+                    )
+                    sender._connected = False
+                    results[board_id] = False
+                    pending.discard(board_id)
+                    continue
 
-                line = conn.readline()
                 progressed = True
                 text = line.decode("utf-8", errors="replace").strip()
                 if not text:
                     continue
-                parsed = sender._parse_response_line(
-                    text, board_id, accepted_commands,
-                )
+                try:
+                    parsed = sender._parse_response_line(
+                        text, board_id, accepted_commands,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "[PUMP_GROUP] %s 解析响应异常,标记失败: %s (text=%r)",
+                        board_id, exc, text,
+                    )
+                    results[board_id] = False
+                    pending.discard(board_id)
+                    continue
                 if parsed is None:
                     continue  # 旧 ACK / READY / STATUS / 无关消息,继续等
                 results[board_id] = parsed
