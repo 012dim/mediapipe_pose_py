@@ -379,3 +379,184 @@ class TestLightSenderAck:
             response_timeout=0.5,
         )
         assert result is False
+
+
+# ============ AutoAckSerial:真实时序仿真(报告 3.6/7.4) ============
+
+class AutoAckSerial(FakeSerial):
+    """每次 write 后自动回 ACK,<板号>,<命令> 的仿真串口。
+
+    模拟 v4.2 Arduino 固件行为(每条命令执行后立即回 ACK),
+    用于测试连续命令时序(如 STOP_ALL → DEFLATE_ALL),
+    验证 ACK 不残留、不误读。
+    """
+
+    def __init__(self, board_id: str) -> None:
+        super().__init__()
+        self.board_id: str = board_id
+
+    def write(self, data) -> int:
+        n = super().write(data)
+        text = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        cmd = text.strip().split(",")[0]
+        self.feed(f"ACK,{self.board_id},{cmd}\n")
+        return n
+
+
+def make_auto_ack_group() -> PumpGroupSender:
+    """构造 3 板全部自动 ACK 的 PumpGroupSender(真实时序仿真)。"""
+    boards_config = [
+        {"id": "PUMP_A", "port": "COM3"},
+        {"id": "PUMP_B", "port": "COM5"},
+        {"id": "PUMP_C", "port": "COM7"},
+    ]
+    group = PumpGroupSender(boards_config)
+    for board_id in group.board_ids:
+        sender = group.boards[board_id]
+        sender._connected = True
+        sender.serial_conn = AutoAckSerial(board_id)
+    return group
+
+
+def make_auto_ack_light() -> LightSender:
+    """构造自动 ACK 的 LightSender(真实时序仿真)。"""
+    sender = LightSender(port="COM4")
+    sender._connected = True
+    sender.serial_conn = AutoAckSerial("LIGHT")
+    return sender
+
+
+# ============ 连续命令时序测试(报告 7.4) ============
+
+class TestStaleAckTiming:
+    """报告 7.4:旧 STOP_ALL ACK 不得让正常命令被误判失败。"""
+
+    def test_stale_stop_ack_is_skipped_before_deflate(self) -> None:
+        """旧 ACK,STOP_ALL 残留时发送 DEFLATE_ALL → 跳过旧 ACK,读新 ACK 成功。"""
+        sender = PumpSender(port="COM3")
+        sender._connected = True
+        sender.serial_conn = FakeSerial()
+        # 模拟旧版"只写不读"留下的 STOP_ALL ACK + 本次 DEFLATE_ALL 的 ACK
+        sender.serial_conn.feed(
+            "ACK,PUMP_A,STOP_ALL\n"
+            "ACK,PUMP_A,DEFLATE_ALL\n"
+        )
+
+        result = sender.send_and_wait(
+            "DEFLATE_ALL,5.0",
+            expected_board_id="PUMP_A",
+            accepted_commands={"DEFLATE_ALL"},
+            response_timeout=0.5,
+        )
+        assert result is True
+
+    def test_send_stop_all_collects_ack(self) -> None:
+        """STOP_ALL 必须消耗自己的 ACK:执行后输入缓冲区应为空。"""
+        group = make_auto_ack_group()
+
+        assert group.send_stop_all() is True
+
+        for sender in group.boards.values():
+            assert sender.serial_conn.readline() == b""
+
+    def test_stop_then_deflate_all_success(self) -> None:
+        """仿真 3.6 场景:STOP_ALL → DEFLATE_ALL 连续命令不误判失败。
+
+        (修复前该序列会被误判为 DEFLATE_ALL 失败 → SAFE_STOP)
+        """
+        group = make_auto_ack_group()
+
+        assert group.send_stop_all() is True
+        assert group.send_deflate_all(5.0) is True
+
+    def test_stop_all_partial_failure_no_recursive_retry(self) -> None:
+        """STOP_ALL 部分板失败:不递归重发,返回 False 但不抛异常。
+
+        共享 deadline 语义(报告 7.3 第三步):PUMP_B 无响应会耗尽
+        0.8 秒总时间,PUMP_C 即使正常也来不及读 ACK 而被标记为失败;
+        这保证"三板总等待时间 = response_timeout",不会拖到 3×0.8 秒。
+        """
+        group = make_auto_ack_group()
+        # PUMP_B 不回 ACK(替换为普通 FakeSerial,不自动回)
+        group.boards["PUMP_B"].serial_conn = FakeSerial()
+
+        results = group.stop_all_best_effort()
+        assert results["PUMP_A"] is True    # 先读,B 超时前已成功
+        assert results["PUMP_B"] is False   # 无响应,耗尽共享时间
+        assert results["PUMP_C"] is False   # 共享 deadline 已过,来不及读
+        assert group.send_stop_all() is False
+
+    def test_light_flash_stale_ack_not_pollute_next(self) -> None:
+        """报告 8.4:LIGHT_FLASH 迟到 ACK 不污染下一條 LIGHT_ALL_OFF。"""
+        light = make_auto_ack_light()
+        assert light.send_flash(3) is True
+        # 模拟旧版固件闪烁结束后的迟到 ACK 残留
+        light.serial_conn.feed("ACK,LIGHT,LIGHT_FLASH\n")
+
+        assert light.send_all_off() is True
+        # 且不应有残留
+        assert light.serial_conn.readline() == b""
+
+
+# ============ READY 点充时长校验测试(报告 10.3) ============
+
+class TestReadyParamValidation:
+    """报告 10.3:READY 中的每泵点充时长与期望配置比对。"""
+
+    def _connect_with_ready(self, fake_serial_module, ready_line: str,
+                            expected_params) -> tuple:
+        sender = PumpSender(port="COM3")
+        fake = FakeSerial()
+        fake.feed(ready_line + "\n")
+        fake_serial_module.Serial = lambda *a, **kw: fake
+        ok = sender.connect(
+            expected_board_id="PUMP_A",
+            ready_timeout=1.0,
+            expected_ready_params=expected_params,
+        )
+        return ok, sender
+
+    def test_ready_params_match(self, fake_serial_module) -> None:
+        """READY,PUMP_A,300,500,800 与期望一致 → 连接成功。"""
+        ok, sender = self._connect_with_ready(
+            fake_serial_module, "READY,PUMP_A,300,500,800", [300, 500, 800],
+        )
+        assert ok is True
+        assert sender.is_connected is True
+
+    def test_ready_params_mismatch(self, fake_serial_module) -> None:
+        """READY,PUMP_A,300,500,900 与期望 [300,500,800] 不一致 → 拒绝。"""
+        ok, sender = self._connect_with_ready(
+            fake_serial_module, "READY,PUMP_A,300,500,900", [300, 500, 800],
+        )
+        assert ok is False
+        assert sender.is_connected is False
+
+    def test_ready_board_mismatch_with_params(self, fake_serial_module) -> None:
+        """READY,PUMP_B,300,500,800 但端口期望 PUMP_A → 拒绝连接。"""
+        sender = PumpSender(port="COM3")
+        fake = FakeSerial()
+        fake.feed("READY,PUMP_B,300,500,800\n")
+        fake_serial_module.Serial = lambda *a, **kw: fake
+
+        ok = sender.connect(
+            expected_board_id="PUMP_A",
+            ready_timeout=1.0,
+            expected_ready_params=[300, 500, 800],
+        )
+        assert ok is False
+        assert sender.is_connected is False
+
+    def test_ready_non_integer_rejected(self, fake_serial_module) -> None:
+        """READY,PUMP_A,a,500,800(非整数)→ 拒绝连接。"""
+        ok, _ = self._connect_with_ready(
+            fake_serial_module, "READY,PUMP_A,a,500,800", [300, 500, 800],
+        )
+        assert ok is False
+
+    def test_ready_missing_params_rejected(self, fake_serial_module) -> None:
+        """READY,PUMP_A 缺少时长参数 → 正式模式(带期望)拒绝连接。"""
+        ok, _ = self._connect_with_ready(
+            fake_serial_module, "READY,PUMP_A", [300, 500, 800],
+        )
+        assert ok is False

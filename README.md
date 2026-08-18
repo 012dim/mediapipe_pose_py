@@ -4,7 +4,7 @@
 
 > **架构版本**:v4.2 — 3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用 RC 脉冲 + 继电器供电隔离模型。
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10.14-green) ![OpenCV](https://img.shields.io/badge/OpenCV-4.8%2B-orange) ![Arduino](https://img.shields.io/badge/Arduino-Uno-00979D) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10.21-green) ![OpenCV](https://img.shields.io/badge/OpenCV-4.9.0.80-orange) ![Arduino](https://img.shields.io/badge/Arduino-Uno-00979D) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ## 特性
 
@@ -298,7 +298,6 @@ mediapipe_pose_py/
 │   ├── pose_detector.py        # MediaPipe 姿态识别封装
 │   ├── visualizer.py           # 骨骼绘制 + 状态机面板 + 灯泡显示
 │   ├── action_recognizer.py    # 手部动作识别 + check_match 匹配
-│   ├── angle_calculator.py     # 关节角度计算工具
 │   ├── state_machine.py        # 9 状态有限状态机(含 SAFE_STOP,核心)
 │   └── serial_sender.py        # PumpSender / PumpGroupSender / LightSender
 ├── arduino_commands/           # Arduino 参考代码(不被 Python 执行)

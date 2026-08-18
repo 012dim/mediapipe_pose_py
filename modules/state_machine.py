@@ -1,4 +1,4 @@
-"""8 状态有限状态机:控制 Arduino 气泵 + 灯箱交互流程。
+"""9 状态有限状态机:控制 Arduino 气泵 + 灯箱交互流程。
 
 状态流转:
     INIT        充气 a 秒, gass=a
@@ -18,9 +18,14 @@
                                 ↓
                               回 INIT
 
-安全机制:在 EXTRACTING/COUNTING/INFLATING/INTERVAL/ENDING 状态下,
-若人离开 ≥ n4 秒,立即触发 DEFLATING(发 STOP_ALL → LIGHT_ALL_OFF → DEFLATE_ALL)。
-INFLATING 中若 gass 达到 GAS_MAX,同样触发安全放气(防过充)。
+安全机制:
+1. 在 EXTRACTING/COUNTING/INFLATING/INTERVAL/ENDING 状态下,
+   若人离开 ≥ n4 秒,立即触发 DEFLATING(发 STOP_ALL → LIGHT_ALL_OFF → DEFLATE_ALL)。
+2. INFLATING 中若 gass 达到 GAS_MAX:发送 STOP_ALL 并锁定后续充气指令
+   (_inflate_locked=True),不触发放气;状态机正常流转,完成 ENDING →
+   DEFLATING 后 gass 清零、解除锁定并回 INIT。
+3. 任一泵控板发送失败 → SAFE_STOP(9 号状态):全组停止,在线板持续放气,
+   放气完成后保持等待用户按 q 退出,不自动恢复、不允许 r 重置。
 """
 import logging
 import random
@@ -106,7 +111,8 @@ class StateSnapshot:
 
 
 class StateMachine:
-    """8 状态有限状态机。
+    """9 状态有限状态机(INIT/WAITING/EXTRACTING/COUNTING/INFLATING/INTERVAL/
+    ENDING/DEFLATING/SAFE_STOP)。
 
     主循环每帧调用 update(person_detected, hand_action),返回 StateSnapshot。
     所有串口发送失败均由 PumpGroupSender/LightSender 内部容错;泵组任一板

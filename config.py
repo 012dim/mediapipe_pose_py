@@ -40,11 +40,8 @@ MAX_RECENT_ACTIONS: int = 3            # 屏幕底部最多显示的动作数量
 # SERIAL_ENABLED=True:严格门禁,3块泵控UNO必须全部连接才进入运行态
 # SERIAL_ENABLED=False:跳过串口(测试用),状态机仍流转,发送静默失败
 SERIAL_ENABLED: bool = False
-SERIAL_BAUDRATE: int = 9600          # 兼容旧代码,实际用 ARDUINO_BAUDRATE
 SERIAL_TIMEOUT: float = 1.0           # 读超时(秒)
 SERIAL_WRITE_TIMEOUT: float = 0.5    # 写超时(秒,防卡死)
-SERIAL_INTERVAL: float = 0.2          # 串口定时发送间隔(秒)
-SERIAL_SEND_NONE: bool = True         # 无动作时是否发送 NONE
 
 
 # ============ Arduino 交互流程配置 ============

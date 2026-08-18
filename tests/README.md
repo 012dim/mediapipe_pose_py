@@ -11,7 +11,7 @@
 pytest tests/ -v
 
 # 运行单个测试文件
-pytest tests/test_angle_calculator.py -v
+pytest tests/test_action_recognizer.py -v
 
 # 运行单个测试类
 pytest tests/test_action_recognizer.py::TestHandUp -v
@@ -24,8 +24,9 @@ pytest tests/ --cov=modules --cov-report=term-missing
 
 | 测试文件 | 覆盖模块 | 说明 |
 |---------|---------|------|
-| `test_angle_calculator.py` | `modules/angle_calculator.py` | 三点夹角、膝关节角度、平均值计算 |
-| `test_action_recognizer.py` | `modules/action_recognizer.py` | 6 种动作识别、冷却、重置逻辑 |
+| `test_action_recognizer.py` | `modules/action_recognizer.py` | 3 种举手动作识别(镜像约定)、动作匹配判定、冷却、重置逻辑 |
+| `test_state_machine.py` | `modules/state_machine.py` | 9 状态流转、错误动作立即充气、GAS_MAX 锁定、SAFE_STOP、人离开放气 |
+| `test_serial_sender.py` | `modules/serial_sender.py` | READY 板号/时长校验、ACK/ERR、超时、旧 ACK 跳过、三板广播、STOP_ALL 连续命令 |
 
 ## 说明
 

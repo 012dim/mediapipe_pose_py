@@ -104,14 +104,17 @@ MediaPipe 内置 35 条骨骼连线,定义关键点之间的连接关系:
 
 ## 本项目使用到的关键点
 
+当前版本(v4.2)仅识别 3 种举手动作(LEFT_HAND_UP / RIGHT_HAND_UP /
+BOTH_HANDS_UP)+ 无人状态,不再使用站立、坐下、跌倒和膝关节角度判定。
+
 | 关键点 | 索引 | 用途 |
 |--------|------|------|
-| nose | 0 | 举手中"鼻子 Y"基准 |
-| left_shoulder / right_shoulder | 11 / 12 | 跌倒判定(肩宽、肩水平) |
-| left_wrist / right_wrist | 15 / 16 | 举手判定 |
-| left_hip / right_hip | 23 / 24 | 跌倒判定、膝关节角度计算 |
-| left_knee / right_knee | 25 / 26 | 膝关节顶点 |
-| left_ankle / right_ankle | 27 / 28 | 膝关节角度计算 |
+| nose | 0 | 举手判定中"鼻子 Y"基准;核心关键点可靠性校验 |
+| left_shoulder / right_shoulder | 11 / 12 | 核心关键点可靠性校验(挡椅子/衣架等误检) |
+| left_wrist / right_wrist | 15 / 16 | 举手判定(画面镜像后与用户左右手一致) |
+
+> 注:髋(23/24)、膝(25/26)、踝(27/28)等下肢关键点当前版本仅用于
+> 骨骼可视化,不参与任何动作判定逻辑。
 
 ## 颜色分组(visualizer.py)
 

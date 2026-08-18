@@ -23,14 +23,17 @@
   LIGHT_ON,id           点亮指定编号灯泡(id ∈ {1,2,3})
                         例如 "LIGHT_ON,1" 点亮灯1
   LIGHT_OFF,id          熄灭指定编号灯泡
-  LIGHT_ALL_OFF         全部 3 个灯泡熄灭
+  LIGHT_ALL_OFF         全部 3 个灯泡熄灭(闪烁进行中也能立即中断)
   LIGHT_FLASH,3         三灯同时闪烁 3 次(用于 ENDING 结束阶段)
-                        每次亮 300ms、灭 300ms
+                        每次亮 300ms、灭 300ms;先立即回 ACK,再以
+                        millis() 非阻塞方式推进闪烁,期间可随时接收新指令
+                        (times 合法范围 1..20,超出回 ERR)
 
 【响应格式(v4.2 握手)】
   上电就绪:  READY,LIGHT
   指令成功:  ACK,LIGHT,<命令>     例如 ACK,LIGHT,LIGHT_ON
   指令失败:  ERR,LIGHT,<原因>     例如 ERR,LIGHT,BAD_LIGHT_ID
+                                    或 ERR,LIGHT,BAD_FLASH_COUNT
 
   Python 端 connect(expected_board_id="LIGHT") 会校验 READY 中的板号,
   每条指令通过 send_and_wait() 等待 ACK/ERR(超时即视为失败)。
@@ -136,20 +139,73 @@ void allOn() {
 }
 
 /**
- * flashAll - 三灯同时闪烁指定次数
- * @param times  闪烁次数(如 ENDING 阶段传入 3)
- *
- * 每次循环:三灯全亮 -> 延时 FLASH_ON_MS -> 三灯全灭 -> 延时 FLASH_OFF_MS
- * 注意:此函数使用 delay() 阻塞,期间无法接收新指令。
- *       闪烁总时长 = times × (FLASH_ON_MS + FLASH_OFF_MS)
- *       默认 3 次 × (300+300)ms = 1.8 秒,影响可接受。
+ * ==================== 非阻塞闪烁状态机(报告 8.3)====================
+ * 旧版 flashAll() 使用 delay() 阻塞 1.8 秒,导致:
+ *   1. ACK 在闪烁全部结束后才发送,Python 端 0.8 秒超时必然触发;
+ *   2. 闪烁期间无法接收新指令(如 LIGHT_ALL_OFF 无法立即灭灯)。
+ * 现改为:收到 LIGHT_FLASH 先立即回 ACK,再用 millis() 非阻塞推进闪烁,
+ * 期间可随时被 LIGHT_ALL_OFF / LIGHT_ON / LIGHT_OFF 中断取消。
  */
-void flashAll(int times) {
-  for (int n = 0; n < times; n++) {   // 循环 times 次
-    allOn();                          // 三灯全亮
-    delay(FLASH_ON_MS);               // 保持亮 FLASH_ON_MS 毫秒
-    allOff();                         // 三灯全灭
-    delay(FLASH_OFF_MS);              // 保持灭 FLASH_OFF_MS 毫秒
+
+// ---- 闪烁运行时变量 ----
+bool flashActive = false;       // 是否正在闪烁
+bool flashOnPhase = false;      // true=当前处于"亮"阶段
+int flashRemaining = 0;         // 剩余闪烁次数
+unsigned long flashPhaseStart = 0;  // 当前阶段(亮/灭)的起始时刻(millis)
+
+/**
+ * cancelFlash - 立即取消正在进行的闪烁并熄灭全部灯
+ * 供 LIGHT_ALL_OFF / LIGHT_ON / LIGHT_OFF 指令中断闪烁时调用
+ */
+void cancelFlash() {
+  flashActive = false;
+  flashOnPhase = false;
+  flashRemaining = 0;
+  allOff();
+}
+
+/**
+ * startFlash - 启动非阻塞闪烁
+ * @param times 闪烁次数(1..20,由调用方校验)
+ *
+ * 立即点亮三灯并记录阶段起点,后续由 loop() 尾部的 updateFlash() 推进。
+ * 不使用 delay(),因此调用后可立即返回并继续处理串口。
+ */
+void startFlash(int times) {
+  flashRemaining = times;
+  flashActive = true;
+  flashOnPhase = true;
+  flashPhaseStart = millis();
+  allOn();
+}
+
+/**
+ * updateFlash - 每轮 loop() 调用,用 millis() 推进闪烁状态机(非阻塞)
+ *
+ * 状态推进:亮 FLASH_ON_MS -> 灭 FLASH_OFF_MS -> 次数减一 ->
+ *           次数耗尽则熄灭并结束,否则再次点亮进入下一轮。
+ */
+void updateFlash() {
+  if (!flashActive) return;   // 未在闪烁,直接返回
+
+  unsigned long duration = flashOnPhase ? FLASH_ON_MS : FLASH_OFF_MS;
+
+  if ((millis() - flashPhaseStart) < duration) return;  // 当前阶段未结束
+
+  flashPhaseStart = millis();   // 进入下一阶段,重置计时
+
+  if (flashOnPhase) {
+    allOff();                   // 亮阶段结束 -> 熄灭
+    flashOnPhase = false;
+  } else {
+    flashRemaining--;           // 一个完整"亮+灭"周期结束,次数减一
+    if (flashRemaining <= 0) {
+      allOff();
+      flashActive = false;      // 全部闪烁完成
+      return;
+    }
+    allOn();                    // 开始下一轮点亮
+    flashOnPhase = true;
   }
 }
 
@@ -199,10 +255,13 @@ void setup() {
 /**
  * loop - Arduino 主循环,反复执行
  *
- * 每轮检查串口是否有新指令,有则解析并执行。
- * 灯泡状态为持续保持(点亮后一直亮,直到收到熄灭指令),无需定时检查。
+ * 每轮:1) 检查串口是否有新指令,有则解析并执行(ACK/ERR 立即回送)
+ *      2) 推进非阻塞闪烁状态机(updateFlash,不使用 delay)
+ * 因此闪烁期间仍可立即处理 LIGHT_ALL_OFF 等新指令。
  *
- * v4.2:每条指令执行后回送 ACK/ERR,Python 端 send_and_wait() 据此判断成败。
+ * v4.2:每条指令执行后回送 ACK/ERR,Python 端 send_and_wait() 据此判断成败;
+ *      LIGHT_FLASH 先回 ACK 再启动闪烁(报告 8.2/8.3),
+ *      保证 Python 端 0.8 秒内收到 ACK,不产生迟到 ACK。
  */
 void loop() {
   if (Serial.available()) {                     // 串口缓冲区有数据
@@ -216,6 +275,7 @@ void loop() {
       // substring(9) 截取 "LIGHT_ON," 之后的数字部分
       int id = line.substring(9).toInt();       // 解析灯号(1/2/3)
       if (id >= 1 && id <= 3) {
+        cancelFlash();                          // 中断正在进行的闪烁
         setLight(id - 1, true);                 // id 转 0 基索引
         sendACK("LIGHT_ON");
       } else {
@@ -226,26 +286,33 @@ void loop() {
       // substring(10) 截取 "LIGHT_OFF," 之后的数字部分
       int id = line.substring(10).toInt();
       if (id >= 1 && id <= 3) {
+        cancelFlash();                          // 中断正在进行的闪烁
         setLight(id - 1, false);
         sendACK("LIGHT_OFF");
       } else {
         sendERR("BAD_LIGHT_ID");
       }
     } else if (line == "LIGHT_ALL_OFF") {
-      // 指令:LIGHT_ALL_OFF -> 全部熄灭
-      allOff();
+      // 指令:LIGHT_ALL_OFF -> 取消闪烁并全部熄灭
+      // (闪烁进行中收到此指令也能立即灭灯,报告 8.3)
+      cancelFlash();
       sendACK("LIGHT_ALL_OFF");
     } else if (line.startsWith("LIGHT_FLASH,")) {
-      // 指令:LIGHT_FLASH,n -> 三灯闪烁 n 次
+      // 指令:LIGHT_FLASH,n -> 三灯闪烁 n 次(非阻塞)
       // substring(12) 截取 "LIGHT_FLASH," 之后的数字部分
       int times = line.substring(12).toInt();
-      if (times <= 0) times = 3;   // 容错:未指定或非法时默认闪 3 次
-      flashAll(times);
-      sendACK("LIGHT_FLASH");      // 即使 times 被容错修正,也回送成功
+      if (times <= 0 || times > 20) {
+        sendERR("BAD_FLASH_COUNT");             // 非法次数(1..20)
+      } else {
+        startFlash(times);                      // 启动非阻塞闪烁
+        sendACK("LIGHT_FLASH");                 // 先回 ACK(0.8s 内可达)
+      }
     } else {
       sendERR("UNKNOWN_CMD");      // 未知指令
     }
   }
+
+  updateFlash();   // 推进非阻塞闪烁(未闪烁时立即返回)
 }
 
 ================================================================================

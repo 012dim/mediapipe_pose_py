@@ -370,3 +370,31 @@ class TestSafeStopBehavior:
         pump.send_inflate_all_ret = True
         sm.reset()
         assert sm.state == STATE_INIT
+
+
+# ============ 真实时序仿真测试(复查报告 7.4 测试三) ============
+
+class TestNormalSafetySequence:
+    """报告 7.4 测试三:正常安全放气序列不得误入 SAFE_STOP。
+
+    使用 AutoAckSerial(每条命令自动回 ACK)模拟 3 板泵控 + 灯箱
+    全部在线且正常执行的固件行为(报告 3.6 的串口协议仿真)。
+    修复前:STOP_ALL 只写不读 → ACK 残留 → DEFLATE_ALL 读到旧 ACK
+    被误判失败 → SAFE_STOP(即使所有板都正常)。
+    修复后:STOP_ALL 消耗自己的 ACK → DEFLATE_ALL 正常收到 ACK → DEFLATING。
+    """
+
+    def test_normal_safety_sequence_enters_deflating(self) -> None:
+        from test_serial_sender import make_auto_ack_group, make_auto_ack_light
+
+        pump = make_auto_ack_group()
+        light = make_auto_ack_light()
+        sm = StateMachine(pump, light)
+        # INIT:send_inflate_all 应读到 ACK 成功(否则直接 SAFE_STOP)
+        assert sm.state == STATE_INIT
+
+        # 触发安全放气序列:STOP_ALL → LIGHT_ALL_OFF → DEFLATE_ALL
+        sm._trigger_safety()
+
+        # 全部板正常时,应进入 DEFLATING 而非 SAFE_STOP
+        assert sm.state == STATE_DEFLATING

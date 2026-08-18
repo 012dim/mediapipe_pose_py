@@ -116,8 +116,12 @@ class Application:
         )
 
         if config.SERIAL_ENABLED:
-            # 三板门禁:必须 3 块泵控全部连接
-            if not self.pump_group.connect_all():
+            # 三板门禁:必须 3 块泵控全部连接,且每板 READY 中的
+            # 板号 + 3 泵点充时长均与 config.INFLATE_M_MS_PER_BOARD 一致
+            # (拦截"烧错参数"或"改了配置未重烧 Arduino")
+            if not self.pump_group.connect_all(
+                expected_inflate_m_ms=config.INFLATE_M_MS_PER_BOARD,
+            ):
                 connected = self.pump_group.get_connected_board_ids()
                 missing = [bid for bid in ('PUMP_A', 'PUMP_B', 'PUMP_C')
                            if bid not in connected]
@@ -196,6 +200,10 @@ class Application:
             state = self.action_recognizer.recognize_current(pose_result)
             self.visualizer.set_current_state(state)
             self._log_state_change(state)      # 状态变化时才打印日志
+
+            # 仅供动作历史/冷却显示,不参与状态机充气判定
+            # (状态机使用的是上面不受冷却限制的 state.hand_action)
+            self.action_recognizer.recognize(pose_result)
 
             # 状态机推进(每帧调用,返回快照供可视化)
             if self.state_machine is not None:
