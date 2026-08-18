@@ -739,3 +739,144 @@ class TestFairPollingExceptionHandling:
         # B/C 仍连接正常
         assert group.boards["PUMP_B"].is_connected is True
         assert group.boards["PUMP_C"].is_connected is True
+
+
+# ============ 灯箱 _read_ack 异常容错测试(报告 9.4) ============
+
+class BrokenReadlineSerial(FakeSerial):
+    """模拟 readline() 抛 OSError 的故障串口(报告 9.1)。
+
+    报告 9.1:灯箱 USB 拔出时 readline() 会抛 OSError,
+    旧版 _read_ack() 未捕获导致异常冒泡主循环退出。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def readline(self) -> bytes:
+        raise OSError("simulated USB unplug")
+
+
+class TestLightReadAckException:
+    """报告 9.4:灯箱 _read_ack 捕获 OSError 后应:
+
+    1. 返回 False(不抛异常)
+    2. 标记 sender._connected = False
+    3. 关闭并清理 serial_conn(不泄漏句柄)
+    4. 后续调用不再尝试访问已断开串口
+    """
+
+    def _make_light_with_broken_read(self) -> LightSender:
+        light = LightSender(port="COM4")
+        light._connected = True
+        light.serial_conn = BrokenReadlineSerial()
+        return light
+
+    def test_light_read_exception_returns_false(self) -> None:
+        """灯箱 send_light_on 的 readline 抛 OSError → 返回 False(不抛异常)。"""
+        light = self._make_light_with_broken_read()
+        # send_light_on 内部走 send_and_wait → _read_ack,
+        # readline 抛 OSError 应被捕获,返回 False
+        result = light.send_light_on(1)
+        assert result is False
+
+    def test_light_read_exception_marks_disconnected(self) -> None:
+        """异常后 sender.is_connected 应为 False。"""
+        light = self._make_light_with_broken_read()
+        light.send_light_on(1)
+        assert light.is_connected is False
+
+    def test_light_read_exception_clears_serial_conn(self) -> None:
+        """异常后 serial_conn 应被置 None,防止后续误用已关闭句柄。"""
+        light = self._make_light_with_broken_read()
+        light.send_light_on(1)
+        assert light.serial_conn is None
+
+    def test_light_subsequent_call_after_disconnect_returns_false(self) -> None:
+        """断开后再次调用应直接返回 False,不访问 serial_conn。"""
+        light = self._make_light_with_broken_read()
+        # 第一次调用触发异常并标记断开
+        assert light.send_light_on(1) is False
+        # 第二次调用应直接走"未连接"分支,不抛异常
+        assert light.send_light_off(1) is False
+        assert light.send_all_off() is False
+        assert light.send_flash(3) is False
+
+    def test_light_off_exception_returns_false(self) -> None:
+        """send_light_off 也能正确处理 readline 异常。"""
+        light = self._make_light_with_broken_read()
+        assert light.send_light_off(1) is False
+        assert light.is_connected is False
+
+    def test_light_all_off_exception_returns_false(self) -> None:
+        """send_all_off 也能正确处理 readline 异常。"""
+        light = self._make_light_with_broken_read()
+        assert light.send_all_off() is False
+        assert light.is_connected is False
+
+    def test_light_flash_exception_returns_false(self) -> None:
+        """send_flash 也能正确处理 readline 异常。"""
+        light = self._make_light_with_broken_read()
+        assert light.send_flash(3) is False
+        assert light.is_connected is False
+
+
+# ============ PumpSender / PumpGroupSender HOLD_ALL 测试(v4.4) ============
+
+class TestHoldAll:
+    """v4.4 新增:HOLD_ALL 命令对应固件 holdPressure()(报告 7.4)。
+
+    验证:
+    - 单板 send_hold_all() 发送 HOLD_ALL 并等待 ACK
+    - 三板广播 send_hold_all() 部分失败时触发 STOP_ALL + 返回 False
+    - 三板广播全部成功时返回 True
+    """
+
+    def test_single_board_hold_all_success(self) -> None:
+        """单板 HOLD_ALL 收到 ACK → 返回 True。"""
+        sender = PumpSender(port="COM3")
+        sender._connected = True
+        sender.serial_conn = AutoAckSerial("PUMP_A")
+
+        result = sender.send_hold_all()
+        assert result is True
+        # 验证发送的命令文本
+        sent = b"".join(sender.serial_conn._output).decode("utf-8")
+        assert "HOLD_ALL\n" in sent
+
+    def test_single_board_hold_all_err(self) -> None:
+        """单板 HOLD_ALL 收到 ERR → 返回 False。"""
+        sender = PumpSender(port="COM3")
+        sender._connected = True
+        sender.serial_conn = FakeSerial()
+        sender.serial_conn.feed("ERR,PUMP_A,NOT_ARMED\n")
+
+        result = sender.send_hold_all()
+        assert result is False
+
+    def test_group_hold_all_all_success(self) -> None:
+        """三板广播 HOLD_ALL 全部 ACK → 返回 True。"""
+        group = make_auto_ack_group()
+        assert group.send_hold_all() is True
+
+    def test_group_hold_all_partial_failure_triggers_stop_all(self) -> None:
+        """PUMP_B 失败 → send_hold_all 返回 False 并触发 STOP_ALL。"""
+        group = make_auto_ack_group()
+        # PUMP_B 替换为不自动回 ACK 的 FakeSerial
+        group.boards["PUMP_B"].serial_conn = FakeSerial()
+
+        # 拦截 stop_all_best_effort 调用计数
+        stop_calls = []
+        original_stop_all = group.stop_all_best_effort
+        group.stop_all_best_effort = lambda: stop_calls.append(1) or original_stop_all()
+
+        result = group.send_hold_all()
+        assert result is False
+        # 应触发 STOP_ALL 兜底
+        assert len(stop_calls) == 1
+
+    def test_group_hold_all_test_mode_skips_send(self) -> None:
+        """test_mode=True 时 HOLD_ALL 跳过发送并返回成功。"""
+        boards_config = [{"id": "PUMP_A", "port": "COM3"}]
+        group = PumpGroupSender(boards_config, test_mode=True)
+        assert group.send_hold_all() is True

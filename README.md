@@ -2,7 +2,7 @@
 
 基于 Google MediaPipe Pose 的实时手部动作识别项目,并扩展为 4 板 Arduino Uno 控制的气泵 + 灯箱交互系统。摄像头实时识别手部动作,驱动 9 状态有限状态机,通过串口指令控制 9 泵同步充放气与灯箱亮灭,实现"抽题 → 计时 → 惩罚充气 → 结束放气"的完整交互流程。
 
-> **架构版本**:v4.3 — 3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用**占空比 PWM + 继电器供电隔离**模型(报告 c15a9b0 P0:弃用 RC Servo 脉冲,改用 `analogWrite()` 硬件 PWM;新增 `VALVE_ENERGIZED_MEANS_OPEN` 阀极性配置)。
+> **架构版本**:v4.4 — 3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用**占空比 PWM + 继电器供电隔离**模型(v4.3 报告 c15a9b0 P0:弃用 RC Servo 脉冲,改用 `analogWrite()` 硬件 PWM;新增 `VALVE_ENERGIZED_MEANS_OPEN` 阀极性配置)。v4.4 报告 107d463 复查:拆分 `stopPumpsImmediately` / `holdPressure` / `safeVent` 阀停止语义并新增 `HOLD_ALL` 命令;三份固件改为非阻塞 `pollSerial()` 串口解析;Python `_read_ack()` 捕获 USB 断开异常;单板测试固件 `STOP_PUMPS` 改为立即硬断电 + 泵阀互锁 + 防回绕定时。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10.21-green) ![OpenCV](https://img.shields.io/badge/OpenCV-4.9.0.80-orange) ![Arduino](https://img.shields.io/badge/Arduino-Uno-00979D) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -113,7 +113,15 @@ python main.py
 > - 区分 `normalPumpOff`(PWM OFF 保持 50ms 再断继电器)与 `emergencyPumpOff`(立即硬断电)
 > - 严格数值解析 `parseStrictUInt` / `parseStrictFloatSeconds` 替代 `toInt`/`toFloat`(报告 P2)
 >
-> 3 块泵控板烧同一份 [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino),仅修改顶部 `BOARD_ID` 即可区分。
+> 3 块泵控板烧同一份 [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2/pump_uno_v4_2.ino),仅修改顶部 `BOARD_ID` 即可区分。
+
+> ★ v4.4 新增(报告 107d463):
+> - 拆分阀停止语义:`stopPumpsImmediately()`(只停泵) / `holdPressure()`(停泵+关阀保压) / `safeVent()`(停泵+开阀放气)。
+> - 新增 `HOLD_ALL` 命令(对应 `holdPressure()`),用于动作恢复/GAS_MAX 后停泵保压。
+> - `STOP_ALL` 改走 `safeVent()` 明确"停泵+放气"语义,放气 5 秒后自动关阀。
+> - 三份固件统一改为非阻塞 `pollSerial()` + `rxBuffer[]` 串口解析(报告 6.3)。
+> - `parseStrictUInt` 增加 `ULONG_MAX` 溢出检查(报告 10.3)。
+> - sketch 已移入同名目录 `arduino_commands/pump_uno_v4_2/`,与灯箱/单板测试结构统一。
 
 ### 9 状态机流程
 
@@ -194,19 +202,20 @@ Python 端 `PumpGroupSender` 把每条逻辑命令广播给 3 块板;每块板�
 
 完整的 Arduino 代码(含详细注释)见 [arduino_commands/](arduino_commands/) 目录:
 
-- [pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2.ino) — **★ 当前版本(v4.3)** 3 块泵控 UNO 共用源码。基于**占空比 PWM + 继电器供电隔离**模型,扩展至 3 泵 + 3 阀 = 6 设备。烧录前必须修改:
+- [pump_uno_v4_2/pump_uno_v4_2.ino](arduino_commands/pump_uno_v4_2/pump_uno_v4_2.ino) — **★ 当前版本(v4.4)** 3 块泵控 UNO 共用源码。基于**占空比 PWM + 继电器供电隔离**模型,扩展至 3 泵 + 3 阀 = 6 设备。烧录前必须修改:
   - `BOARD_ID`:`PUMP_A` / `PUMP_B` / `PUMP_C`
   - `INFLATE_M_MS_PER_PUMP[3]`:本板 3 个泵的实测吸气时长(毫秒,≤ 1000)
   - `VALVE_ENERGIZED_MEANS_OPEN`:★ **必须由实物实测确定**(报告 c15a9b0 P0)
   - `RELAY_ACTIVE_LOW`:实测继电器触发电平
-- [pump_uno_single_board_test/pump_uno_single_board_test.ino](arduino_commands/pump_uno_single_board_test/pump_uno_single_board_test.ino) — **★ v1.0 单板泵阀联合测试固件**(报告 11.x)。无需 Python 主程序即可在 Arduino 串口监视器手动验证继电器、PWM S 线、阀状态、泵停止。提供 `ARM` / `TEST_RELAY` / `TEST_SIGNAL` / `VALVE_OPEN` / `INFLATE_CHANNEL` / `STOP_PUMPS` / `SAFE_VENT` 等命令,单次测试硬上限 2000ms。**联调前必须先用此固件完成报告 12.2~12.5 各阶段验证**
-- [pump_uno_commands.txt](arduino_commands/pump_uno_commands.txt) — **(旧版 v4.1,已废弃)** 单板单泵控继电器模型参考代码。仅供历史对照,新项目请使用 `pump_uno_v4_2.ino`
-- [lightbox_uno_v4_2/lightbox_uno_v4_2.ino](arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino) — **★ 当前版本(v4.2.1)** 灯箱 UNO 独立可编译 sketch,非阻塞闪烁状态机(报告 7.1)。可直接用 Arduino IDE 打开上传,无需从 .txt 复制粘贴
+  - v4.4 新增:`HOLD_ALL` 命令(停泵保压)、`STOP_ALL` 改走 `safeVent()`(停泵放气)、非阻塞串口解析、`ULONG_MAX` 溢出检查
+- [pump_uno_single_board_test/pump_uno_single_board_test.ino](arduino_commands/pump_uno_single_board_test/pump_uno_single_board_test.ino) — **★ v1.1 单板泵阀联合测试固件**(报告 11.x / 107d463 复查)。无需 Python 主程序即可在 Arduino 串口监视器手动验证继电器、PWM S 线、阀状态、泵停止。提供 `ARM` / `TEST_RELAY` / `TEST_SIGNAL` / `VALVE_OPEN` / `INFLATE_CHANNEL` / `STOP_PUMPS` / `SAFE_VENT` 等命令,单次测试硬上限 2000ms。v1.1 修复:`STOP_PUMPS` 改为 `emergencyStopAllPumps()` 立即硬断电;增加泵阀互锁(`VALVE_OPEN` 检查对应泵);`TEST_SIGNAL` 参数命名 `off_us/on_us` → `off_duty/on_duty`;定时统一 `start + duration + elapsedSince()` 防回绕;非阻塞串口解析。**联调前必须先用此固件完成报告 12.2~12.5 各阶段验证**
+- [pump_uno_commands.txt](arduino_commands/pump_uno_commands.txt) — **(旧版 v4.1,已废弃)** 单板单泵控继电器模型参考代码。仅供历史对照,新项目请使用 `pump_uno_v4_2/pump_uno_v4_2.ino`
+- [lightbox_uno_v4_2/lightbox_uno_v4_2.ino](arduino_commands/lightbox_uno_v4_2/lightbox_uno_v4_2.ino) — **★ 当前版本(v4.2.2)** 灯箱 UNO 独立可编译 sketch,非阻塞闪烁状态机(报告 7.1)。v4.2.2:非阻塞 `pollSerial()` 串口解析;`parseStrictUInt` 替换宽松 `toInt`;`ULONG_MAX` 溢出检查。可直接用 Arduino IDE 打开上传,无需从 .txt 复制粘贴
 - [lightbox_uno_commands.txt](arduino_commands/lightbox_uno_commands.txt) — 灯箱 UNO 说明文档(接线/协议/参数),固件代码已拆到上述 .ino
 
 烧录步骤:
 
-1. 用 Arduino IDE 打开 `pump_uno_v4_2.ino`,修改顶部 `BOARD_ID` 为 `PUMP_A`
+1. 用 Arduino IDE 打开 `arduino_commands/pump_uno_v4_2/pump_uno_v4_2.ino`,修改顶部 `BOARD_ID` 为 `PUMP_A`
 2. 修改 `INFLATE_M_MS_PER_PUMP[3]` 为本板 3 个泵的实测吸气时长(毫秒,≤ 1000)
 3. ★ 实测确认继电器触发电平与阀通电语义,相应修改 `RELAY_ACTIVE_LOW` 与 `VALVE_ENERGIZED_MEANS_OPEN`(详见报告 c15a9b0 7.2 / 8.3)
 4. 上传至第 1 块 UNO;重复步骤 1-3,改 `BOARD_ID` 为 `PUMP_B` / `PUMP_C` 后分别上传至第 2、3 块 UNO
@@ -326,12 +335,13 @@ mediapipe_pose_py/
 │   ├── state_machine.py        # 9 状态有限状态机(含 SAFE_STOP,核心)
 │   └── serial_sender.py        # PumpSender / PumpGroupSender / LightSender
 ├── arduino_commands/           # Arduino 参考代码(不被 Python 执行)
-│   ├── pump_uno_v4_2.ino       # ★ v4.3 泵控 UNO 源码(3 板共用,改 BOARD_ID)
-│   ├── pump_uno_single_board_test/  # ★ v1.0 单板泵阀联合测试固件(联调前验证)
-│   │   └── pump_uno_single_board_test.ino
+│   ├── pump_uno_v4_2/          # ★ v4.4 泵控 UNO 源码目录(3 板共用,改 BOARD_ID)
+│   │   └── pump_uno_v4_2.ino   # HOLD_ALL/STOP_ALL 阀语义拆分 + 非阻塞串口
+│   ├── pump_uno_single_board_test/  # ★ v1.1 单板泵阀联合测试固件(联调前验证)
+│   │   └── pump_uno_single_board_test.ino  # 立即硬断电 + 泵阀互锁 + 防回绕
 │   ├── pump_uno_commands.txt   # (旧版 v4.1,已废弃)单板泵控参考
-│   ├── lightbox_uno_v4_2/      # ★ v4.2.1 灯箱 UNO 独立 sketch 目录
-│   │   └── lightbox_uno_v4_2.ino # 非阻塞闪烁固件(可直接编译上传)
+│   ├── lightbox_uno_v4_2/      # ★ v4.2.2 灯箱 UNO 独立 sketch 目录
+│   │   └── lightbox_uno_v4_2.ino # 非阻塞闪烁 + 严格整数解析(可直接编译上传)
 │   └── lightbox_uno_commands.txt # 灯箱 UNO 说明文档(接线/协议/参数)
 ├── models/                     # 占位(MediaPipe 用内置模型)
 ├── screenshots/                # 截图保存目录

@@ -1,8 +1,22 @@
 /* =====================================================================
- * 单板泵阀联合测试固件 v1.0(报告 11.x)
+ * 单板泵阀联合测试固件 v1.1(报告 107d463 复查)
  *
  * 用途:实机联调前逐路验证继电器、PWM S 线、阀状态、泵停止,
  *       无需 Python 主程序即可在 Arduino 串口监视器手动测试。
+ *
+ * v1.1 关键变更(报告 107d463 第 5/6/8/10 节):
+ *   1. STOP_PUMPS 改为 emergencyStopAllPumps():两阶段立即硬断电,
+ *      无 delay(),先断全部泵继电器再清 PWM,并清理 inflateChannelActive
+ *      (报告 5.2/8.3:防 STOP 后到时仍输出 DONE 误导测试人员)。
+ *   2. 增加泵阀互锁:VALVE_OPEN 检查对应泵是否运行,运行则拒绝(报告 8.2)。
+ *   3. 串口改为非阻塞缓冲区解析(pollSerial + rxBuffer),不再使用
+ *      阻塞式 Serial.readStringUntil('\n'),半条指令不再延迟泵到时停止
+ *      (报告 6.3)。
+ *   4. TEST_SIGNAL 参数命名修正:off_us/on_us → off_duty/on_duty,
+ *      避免把占空比值误当成 RC 脉宽(报告 10.4)。
+ *   5. 定时统一改为 start + duration + elapsedSince(),防 millis 回绕
+ *      (报告 10.2)。
+ *   6. parseStrictUInt 增加 ULONG_MAX 溢出检查(报告 10.3)。
  *
  * 设计原则(报告 11.3):
  *   - ACK 只表示命令被接受,DONE 只表示软件计时结束
@@ -26,13 +40,13 @@
  *   STATUS                     查询当前板状态
  *   ARM                        启用测试权限(60 秒后自动 DISARMED)
  *   TEST_RELAY,<device>,<ms>   单独吸合继电器 device(0..5)ms 毫秒(≤2000)
- *   TEST_SIGNAL,<device>,<off_us>,<on_us>,<ms>
- *                              测试 PWM S 线:输出 on_us 占空比 ms 毫秒,
- *                              前后各输出 off_us 占空比(≤2000)
- *   VALVE_OPEN,<channel>       打开阀 channel(0..2)
+ *   TEST_SIGNAL,<device>,<off_duty>,<on_duty>,<ms>
+ *                              测试 PWM S 线:输出 on_duty 占空比 ms 毫秒,
+ *                              前后各输出 off_duty 占空比(≤2000)
+ *   VALVE_OPEN,<channel>       打开阀 channel(0..2),若对应泵运行则拒绝
  *   VALVE_CLOSE,<channel>      关闭阀 channel(0..2)
  *   INFLATE_CHANNEL,<ch>,<ms>  关阀 ch + 等稳定 + 启动泵 ch 持续 ms(≤2000)
- *   STOP_PUMPS                  立即停止全部 3 泵
+ *   STOP_PUMPS                  立即硬断电全部 3 泵(无 delay)
  *   SAFE_VENT                  停止所有泵 + 打开所有阀(放气)
  *   DISARM                     立即关闭测试权限
  *
@@ -75,6 +89,9 @@ const unsigned long MAX_TEST_MS       = 2000UL;   // 单次测试硬上限 2 秒
 const unsigned long PWM_OFF_HOLD_MS   = 50UL;     // PWM OFF 帧保持
 const unsigned long VALVE_SETTLE_MS   = 30UL;     // 阀切换稳定
 
+// 串口接收缓冲区(报告 6.3:非阻塞解析,行长度上限)
+const uint8_t RX_BUFFER_SIZE = 64;
+
 /* =====================================================================
  * 参数区结束
  * ===================================================================== */
@@ -88,8 +105,10 @@ int  pwmDuty[6]       = {0, 0, 0, 0, 0, 0};
 bool relayClosed[6]   = {false, false, false, false, false, false};
 
 // 活动测试:TEST_RELAY / TEST_SIGNAL / INFLATE_CHANNEL 各自独立计时
+// 报告 10.2:统一使用 start + duration 形式防 millis 回绕
 bool testRelayActive = false;
-unsigned long testRelayEnd = 0;
+unsigned long testRelayStart = 0;
+unsigned long testRelayDuration = 0;
 int  testRelayDevice = -1;
 
 bool testSignalActive = false;
@@ -99,8 +118,13 @@ int  testSignalDevice = -1;
 bool testSignalOnPhase = false;  // true=输出 ON_DUTY,false=输出 OFF_DUTY
 
 bool inflateChannelActive = false;
-unsigned long inflateChannelEnd = 0;
+unsigned long inflateChannelStart = 0;
+unsigned long inflateChannelDuration = 0;
 int  inflateChannelPumpIdx = -1;
+
+// 串口接收缓冲区(报告 6.3)
+char rxBuffer[RX_BUFFER_SIZE];
+uint8_t rxLength = 0;
 
 // ============ 辅助函数 ============
 
@@ -111,13 +135,21 @@ inline bool elapsedSince(unsigned long start, unsigned long duration) {
   return (millis() - start) >= duration;
 }
 
+/**
+ * parseStrictUInt - 严格无符号整数解析(报告 10.3:增加溢出检查)
+ *
+ * 任一非数字字符返回 false,且极长数字不再无符号回绕成较小值。
+ */
 bool parseStrictUInt(const String &text, unsigned long &value) {
   if (text.length() == 0) return false;
   unsigned long result = 0;
   for (unsigned int i = 0; i < text.length(); i++) {
     char c = text.charAt(i);
     if (c < '0' || c > '9') return false;
-    result = result * 10UL + (unsigned long)(c - '0');
+    unsigned long digit = (unsigned long)(c - '0');
+    // 溢出检查:result * 10 + digit > ULONG_MAX 时拒绝
+    if (result > (ULONG_MAX - digit) / 10UL) return false;
+    result = result * 10UL + digit;
   }
   value = result;
   return true;
@@ -177,7 +209,41 @@ void setPumpRunning(int channel, bool running) {
   }
 }
 
-// 全停(紧急停止语义)
+/**
+ * isPumpRunning - 判断指定通道的泵是否处于运行状态
+ * 报告 8.2:用于泵阀互锁,VALVE_OPEN 前检查对应泵
+ */
+bool isPumpRunning(int channel) {
+  if (channel < 0 || channel >= CHANNEL_COUNT) return false;
+  int dev = pumpToDevice(channel);
+  return relayClosed[dev] && (pwmDuty[dev] == PWM_ON_DUTY);
+}
+
+/**
+ * emergencyStopAllPumps - 立即硬断电全部 3 泵(报告 5.2)
+ *
+ * 两阶段执行,无 delay():
+ *   1. 先断开全部泵继电器(硬件断电优先)
+ *   2. 再清零全部泵 PWM 信号
+ * 同时清理 inflateChannelActive,防止 STOP 后到时仍输出 DONE(报告 8.3)。
+ *
+ * 注意:只断泵,不关阀,避免误改阀状态影响放气测试。
+ */
+void emergencyStopAllPumps() {
+  // 第一阶段:先让全部泵失去动力电源
+  for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+    setRelay(pumpToDevice(ch), false);
+  }
+  // 第二阶段:清零全部泵控制信号
+  for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+    setPwm(pumpToDevice(ch), PWM_OFF_DUTY);
+  }
+  // 清理 INFLATE_CHANNEL 活动标志,防止迟到 DONE(报告 8.3)
+  inflateChannelActive = false;
+  inflateChannelPumpIdx = -1;
+}
+
+// 全停(紧急停止语义):用于 ARM 超时 / DISARM
 void allStop() {
   for (int i = 0; i < 6; i++) {
     emergencyPumpOff(i);
@@ -239,7 +305,8 @@ void printHelp() {
   Serial.println(F("  STATUS"));
   Serial.println(F("  ARM"));
   Serial.println(F("  TEST_RELAY,<device 0..5>,<ms 1..2000>"));
-  Serial.println(F("  TEST_SIGNAL,<device 0..5>,<off_us 0..255>,<on_us 0..255>,<ms 1..2000>"));
+  // 报告 10.4:参数命名修正 off_us/on_us → off_duty/on_duty
+  Serial.println(F("  TEST_SIGNAL,<device 0..5>,<off_duty 0..255>,<on_duty 0..255>,<ms 1..2000>"));
   Serial.println(F("  VALVE_OPEN,<channel 0..2>"));
   Serial.println(F("  VALVE_CLOSE,<channel 0..2>"));
   Serial.println(F("  INFLATE_CHANNEL,<channel 0..2>,<ms 1..2000>"));
@@ -271,7 +338,9 @@ void cmdTestRelay(int device, unsigned long ms) {
   setRelay(device, true);
   testRelayActive = true;
   testRelayDevice = device;
-  testRelayEnd = millis() + ms;
+  // 报告 10.2:start + duration 形式防回绕
+  testRelayStart = millis();
+  testRelayDuration = ms;
   sendACK("TEST_RELAY");
 }
 
@@ -296,9 +365,16 @@ void cmdTestSignal(int device, int offDuty, int onDuty, unsigned long ms) {
   sendACK("TEST_SIGNAL");
 }
 
+/**
+ * cmdValveOpen - 打开阀,带泵阀互锁(报告 8.2)
+ *
+ * 若对应通道泵正在运行,拒绝执行并返回 ERR,PUMP_RUNNING。
+ * 这样可防止"泵充气 + 阀同时放气"的冲突状态。
+ */
 void cmdValveOpen(int channel) {
   if (!armed) { sendERR("NOT_ARMED"); return; }
   if (channel < 0 || channel >= CHANNEL_COUNT) { sendERR("BAD_CHANNEL"); return; }
+  if (isPumpRunning(channel)) { sendERR("PUMP_RUNNING"); return; }
   setValveOpen(channel, true);
   sendACK("VALVE_OPEN");
 }
@@ -321,27 +397,154 @@ void cmdInflateChannel(int channel, unsigned long ms) {
   setPumpRunning(channel, true);
   inflateChannelActive = true;
   inflateChannelPumpIdx = channel;
-  inflateChannelEnd = millis() + ms;
+  // 报告 10.2:start + duration 形式防回绕
+  inflateChannelStart = millis();
+  inflateChannelDuration = ms;
   sendACK("INFLATE_CHANNEL");
 }
 
+/**
+ * cmdStopPumps - 立即硬断电全部泵(报告 5.2)
+ *
+ * 走 emergencyStopAllPumps(),无 delay(),两阶段:
+ *   1. 先断全部泵继电器(硬件断电)
+ *   2. 再清零全部泵 PWM
+ * 并清理 inflateChannelActive,防止迟到 DONE(报告 8.3)。
+ */
 void cmdStopPumps() {
-  for (int i = 0; i < CHANNEL_COUNT; i++) {
-    setPumpRunning(i, false);
-  }
+  emergencyStopAllPumps();
   sendACK("STOP_PUMPS");
 }
 
 void cmdSafeVent() {
-  // 停所有泵 + 打开所有阀放气
-  for (int i = 0; i < CHANNEL_COUNT; i++) {
-    setPumpRunning(i, false);
-  }
+  // 停所有泵(立即硬断电)+ 打开所有阀放气
+  emergencyStopAllPumps();
   delay(VALVE_SETTLE_MS);
   for (int i = 0; i < CHANNEL_COUNT; i++) {
     setValveOpen(i, true);
   }
   sendACK("SAFE_VENT");
+}
+
+// ============ 串口非阻塞解析(报告 6.3)============
+
+/**
+ * pollSerial - 非阻塞串口接收并解析指令
+ *
+ * 报告 6.3:旧版 Serial.readStringUntil('\n') 在收到半条数据时会
+ * 阻塞约 1 秒(Serial 默认超时),延迟泵的到时停止检查。
+ * 新版使用固定缓冲区,逐字符读取,遇到 '\n' 才解析,无任何阻塞。
+ *
+ * 超长指令返回 ERR,LINE_TOO_LONG 并重置缓冲区,防止溢出。
+ */
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') continue;  // 忽略 CR
+
+    if (c == '\n') {
+      rxBuffer[rxLength] = '\0';
+      handleCommand(String(rxBuffer));
+      rxLength = 0;
+      continue;
+    }
+
+    if (rxLength < RX_BUFFER_SIZE - 1) {
+      rxBuffer[rxLength++] = c;
+    } else {
+      // 缓冲区溢出:丢弃当前指令,通知发送方
+      rxLength = 0;
+      sendERR("LINE_TOO_LONG");
+    }
+  }
+}
+
+/**
+ * handleCommand - 解析并执行一行完整指令
+ */
+void handleCommand(const String &line) {
+  String trimmed = line;
+  trimmed.trim();
+  if (trimmed.length() == 0) return;
+
+  if (trimmed == "HELP") {
+    printHelp();
+
+  } else if (trimmed == "STATUS") {
+    sendStatus();
+
+  } else if (trimmed == "ARM") {
+    cmdArm();
+
+  } else if (trimmed == "DISARM") {
+    cmdDisarm();
+
+  } else if (trimmed == "STOP_PUMPS") {
+    cmdStopPumps();
+
+  } else if (trimmed == "SAFE_VENT") {
+    cmdSafeVent();
+
+  } else if (trimmed.startsWith("TEST_RELAY,")) {
+    // TEST_RELAY,device,ms
+    int c1 = trimmed.indexOf(',', 11);
+    if (c1 < 0) { sendERR("BAD_ARGS"); return; }
+    unsigned long device, ms;
+    if (!parseStrictUInt(trimmed.substring(11, c1), device) ||
+        !parseStrictUInt(trimmed.substring(c1 + 1), ms)) {
+      sendERR("BAD_ARGS");
+    } else {
+      cmdTestRelay((int)device, ms);
+    }
+
+  } else if (trimmed.startsWith("TEST_SIGNAL,")) {
+    // TEST_SIGNAL,device,offDuty,onDuty,ms  (报告 10.4:命名修正)
+    int c1 = trimmed.indexOf(',', 12);
+    int c2 = (c1 >= 0) ? trimmed.indexOf(',', c1 + 1) : -1;
+    int c3 = (c2 >= 0) ? trimmed.indexOf(',', c2 + 1) : -1;
+    if (c1 < 0 || c2 < 0 || c3 < 0) { sendERR("BAD_ARGS"); return; }
+    unsigned long device, offDuty, onDuty, ms;
+    if (!parseStrictUInt(trimmed.substring(12, c1), device) ||
+        !parseStrictUInt(trimmed.substring(c1 + 1, c2), offDuty) ||
+        !parseStrictUInt(trimmed.substring(c2 + 1, c3), onDuty) ||
+        !parseStrictUInt(trimmed.substring(c3 + 1), ms)) {
+      sendERR("BAD_ARGS");
+    } else {
+      cmdTestSignal((int)device, (int)offDuty, (int)onDuty, ms);
+    }
+
+  } else if (trimmed.startsWith("VALVE_OPEN,")) {
+    unsigned long ch;
+    if (!parseStrictUInt(trimmed.substring(11), ch)) {
+      sendERR("BAD_CHANNEL");
+    } else {
+      cmdValveOpen((int)ch);
+    }
+
+  } else if (trimmed.startsWith("VALVE_CLOSE,")) {
+    unsigned long ch;
+    if (!parseStrictUInt(trimmed.substring(12), ch)) {
+      sendERR("BAD_CHANNEL");
+    } else {
+      cmdValveClose((int)ch);
+    }
+
+  } else if (trimmed.startsWith("INFLATE_CHANNEL,")) {
+    // INFLATE_CHANNEL,ch,ms
+    int c1 = trimmed.indexOf(',', 16);
+    if (c1 < 0) { sendERR("BAD_ARGS"); return; }
+    unsigned long ch, ms;
+    if (!parseStrictUInt(trimmed.substring(16, c1), ch) ||
+        !parseStrictUInt(trimmed.substring(c1 + 1), ms)) {
+      sendERR("BAD_ARGS");
+    } else {
+      cmdInflateChannel((int)ch, ms);
+    }
+
+  } else {
+    sendERR("UNKNOWN_CMD");
+  }
 }
 
 // ============ setup / loop ============
@@ -358,26 +561,30 @@ void setup() {
     analogWrite(PWM_PINS[i], PWM_OFF_DUTY);
     pwmDuty[i] = PWM_OFF_DUTY;
   }
+  rxLength = 0;
   Serial.println(F("READY,SINGLE_TEST"));
   Serial.println(F("HELP,type HELP for commands; ARM first"));
 }
 
 void loop() {
-  // ---- ARM 超时检查 ----
+  // ---- 安全计时检查(报告 6.3:先于串口处理,确保准时停泵)----
+
+  // ARM 超时
   if (armed && elapsedSince(armTime, ARM_TIMEOUT_MS)) {
     allStop();
     armed = false;
     Serial.println(F("EVENT,ARM_TIMEOUT,DISARMED"));
   }
 
-  // ---- 活动测试计时检查 ----
-  if (testRelayActive && millis() >= testRelayEnd) {
+  // TEST_RELAY 到期
+  if (testRelayActive && elapsedSince(testRelayStart, testRelayDuration)) {
     setRelay(testRelayDevice, false);
     testRelayActive = false;
     testRelayDevice = -1;
     sendDONE("TEST_RELAY");
   }
 
+  // TEST_SIGNAL 到期
   if (testSignalActive && elapsedSince(testSignalStart, testSignalDuration)) {
     // 恢复 OFF_DUTY,断继电器
     setPwm(testSignalDevice, PWM_OFF_DUTY);
@@ -388,95 +595,23 @@ void loop() {
     sendDONE("TEST_SIGNAL");
   }
 
-  if (inflateChannelActive && millis() >= inflateChannelEnd) {
+  // INFLATE_CHANNEL 到期
+  if (inflateChannelActive && elapsedSince(inflateChannelStart, inflateChannelDuration)) {
     setPumpRunning(inflateChannelPumpIdx, false);
     inflateChannelActive = false;
     inflateChannelPumpIdx = -1;
     sendDONE("INFLATE_CHANNEL");
   }
 
-  // ---- 串口指令处理 ----
-  if (!Serial.available()) return;
+  // ---- 串口指令处理(报告 6.3:非阻塞 pollSerial)----
+  pollSerial();
 
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) return;
-
-  if (line == "HELP") {
-    printHelp();
-
-  } else if (line == "STATUS") {
-    sendStatus();
-
-  } else if (line == "ARM") {
-    cmdArm();
-
-  } else if (line == "DISARM") {
-    cmdDisarm();
-
-  } else if (line == "STOP_PUMPS") {
-    cmdStopPumps();
-
-  } else if (line == "SAFE_VENT") {
-    cmdSafeVent();
-
-  } else if (line.startsWith("TEST_RELAY,")) {
-    // TEST_RELAY,device,ms
-    int c1 = line.indexOf(',', 11);
-    if (c1 < 0) { sendERR("BAD_ARGS"); return; }
-    unsigned long device, ms;
-    if (!parseStrictUInt(line.substring(11, c1), device) ||
-        !parseStrictUInt(line.substring(c1 + 1), ms)) {
-      sendERR("BAD_ARGS");
-    } else {
-      cmdTestRelay((int)device, ms);
-    }
-
-  } else if (line.startsWith("TEST_SIGNAL,")) {
-    // TEST_SIGNAL,device,offDuty,onDuty,ms
-    int c1 = line.indexOf(',', 12);
-    int c2 = (c1 >= 0) ? line.indexOf(',', c1 + 1) : -1;
-    int c3 = (c2 >= 0) ? line.indexOf(',', c2 + 1) : -1;
-    if (c1 < 0 || c2 < 0 || c3 < 0) { sendERR("BAD_ARGS"); return; }
-    unsigned long device, offDuty, onDuty, ms;
-    if (!parseStrictUInt(line.substring(12, c1), device) ||
-        !parseStrictUInt(line.substring(c1 + 1, c2), offDuty) ||
-        !parseStrictUInt(line.substring(c2 + 1, c3), onDuty) ||
-        !parseStrictUInt(line.substring(c3 + 1), ms)) {
-      sendERR("BAD_ARGS");
-    } else {
-      cmdTestSignal((int)device, (int)offDuty, (int)onDuty, ms);
-    }
-
-  } else if (line.startsWith("VALVE_OPEN,")) {
-    unsigned long ch;
-    if (!parseStrictUInt(line.substring(11), ch)) {
-      sendERR("BAD_CHANNEL");
-    } else {
-      cmdValveOpen((int)ch);
-    }
-
-  } else if (line.startsWith("VALVE_CLOSE,")) {
-    unsigned long ch;
-    if (!parseStrictUInt(line.substring(12), ch)) {
-      sendERR("BAD_CHANNEL");
-    } else {
-      cmdValveClose((int)ch);
-    }
-
-  } else if (line.startsWith("INFLATE_CHANNEL,")) {
-    // INFLATE_CHANNEL,ch,ms
-    int c1 = line.indexOf(',', 16);
-    if (c1 < 0) { sendERR("BAD_ARGS"); return; }
-    unsigned long ch, ms;
-    if (!parseStrictUInt(line.substring(16, c1), ch) ||
-        !parseStrictUInt(line.substring(c1 + 1), ms)) {
-      sendERR("BAD_ARGS");
-    } else {
-      cmdInflateChannel((int)ch, ms);
-    }
-
-  } else {
-    sendERR("UNKNOWN_CMD");
+  // ---- 安全计时二次检查(报告 6.3 推荐:串口处理后再检查一次,
+  //      以防 pollSerial 内部因解析复杂指令占用时间而错过到时停止)----
+  if (inflateChannelActive && elapsedSince(inflateChannelStart, inflateChannelDuration)) {
+    setPumpRunning(inflateChannelPumpIdx, false);
+    inflateChannelActive = false;
+    inflateChannelPumpIdx = -1;
+    sendDONE("INFLATE_CHANNEL");
   }
 }

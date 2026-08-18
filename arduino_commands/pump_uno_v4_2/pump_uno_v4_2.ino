@@ -1,7 +1,20 @@
 /* =====================================================================
- * 气泵控制 Uno (v4.3) - 3 泵 + 3 阀 = 6 设备
+ * 气泵控制 Uno (v4.4) - 3 泵 + 3 阀 = 6 设备
  *
  * 同一份代码烧录到 3 块 UNO(PUMP_A/B/C),只需修改下方 BOARD_ID
+ *
+ * ★ v4.4 关键变更(报告 107d463 复查):
+ *   1. 拆分阀停止语义(报告 7.3):新增 stopPumpsImmediately / holdPressure
+ *      / safeVent 三个独立函数,不再用单一 allOff() 表达所有停止场景。
+ *   2. 新增 HOLD_ALL 命令(报告 7.4):停泵并关闭全部阀,保持当前气量。
+ *      适配 VALVE_ENERGIZED_MEANS_OPEN 两种极性配置,修复"断电=阀打开"
+ *      的语义冲突(原 STOP_ALL 在 false 配置下会放掉气球)。
+ *   3. STOP_ALL 改为"立即停泵 + 安全放气"(safeVent)的明确语义,
+ *      不再依赖"全断电"歧义。
+ *   4. 串口改为非阻塞缓冲区解析(pollSerial + rxBuffer),不再使用
+ *      阻塞式 Serial.readStringUntil('\n'),半条指令不再延迟泵到时停止
+ *      (报告 6.3)。
+ *   5. parseStrictUInt 增加 ULONG_MAX 溢出检查(报告 10.3)。
  *
  * ★ v4.3 关键变更(实机复查报告 c15a9b0):
  *   1. 弃用 <Servo.h> + writeMicroseconds(RC 脉冲),
@@ -35,7 +48,8 @@
  *   INFLATE_M        9 泵(本板 3 泵)同步点充,每泵独立时长
  *                    (见 INFLATE_M_MS_PER_PUMP[3]);Python 每秒广播一次
  *                    刷新,本地最多持续 INFLATE_M_LOCAL_TIMEOUT_MS 防呆
- *   STOP_ALL         立即停止全部设备(模式互斥优先级最高)
+ *   HOLD_ALL         停泵并关闭全部阀,保持当前气量(报告 7.4)
+ *   STOP_ALL         立即停泵并打开全部阀安全放气(报告 7.4)
  *   STATUS           查询当前状态
  *   TEST_PUMP,i,t    测试第 i 号泵(0..2),持续 t 秒(0 < t <= 5)
  *
@@ -80,12 +94,17 @@ const bool RELAY_ACTIVE_LOW = true;
 // 实测方法:断开阀控制信号,只通电/断电继电器,观察气路状态
 // 当前默认值 = true(继电器通电时阀打开排气)。
 // 若实测发现"断电时阀放气",改为 false。
+// ★ v4.4 重要:无论 true/false,HOLD_ALL 都会正确关阀保压,
+//   STOP_ALL 都会正确开阀放气(已由 setValveOpen 自动映射)。
 const bool VALVE_ENERGIZED_MEANS_OPEN = true;
 
 // ---- PWM 占空比参数(0..255)----
 // PWM_ON_DUTY  = 启动设备(满占空比 255)
 // PWM_OFF_DUTY = 停止设备(零占空比 0)
 // 若电子开关需要特定阈值(如 ≥200 才识别为 ON),在此调整
+// 注意(报告 4.1):AVR 核心中 analogWrite(pin, 255) 实际为常高电平,
+//                 不输出周期性方波;若电子开关要求持续方波,
+//                 应改为 254 并用示波器确认波形。
 const int PWM_ON_DUTY  = 255;
 const int PWM_OFF_DUTY = 0;
 
@@ -126,6 +145,9 @@ const float MAX_DURATION_SEC = 30.0;
 // ---- TEST_PUMP 测试时长上限(秒)----
 const float TEST_PUMP_MAX_SEC = 5.0;
 
+// ---- 串口接收缓冲区(报告 6.3:非阻塞解析)----
+const uint8_t RX_BUFFER_SIZE = 64;
+
 /* =====================================================================
  * 用户可调参数区结束
  * ===================================================================== */
@@ -138,6 +160,8 @@ enum Mode {
   MODE_DEFLATE_ALL,
   MODE_INFLATE_M,
   MODE_TEST,
+  MODE_HOLD,        // v4.4:停泵保压
+  MODE_SAFE_VENT,   // v4.4:停泵放气(STOP_ALL 后等待放气时长)
 };
 Mode currentMode = MODE_IDLE;
 
@@ -159,10 +183,20 @@ unsigned long testDuration        = 0;
 unsigned long inflateMPumpStart[3]    = {0, 0, 0};  // 每泵本轮启动时刻
 bool          inflateMPumpActive[3]   = {false, false, false};
 
+// v4.4:STOP_ALL 安全放气计时(放气持续 DEFLATE_ALL_DEFAULT_MS 后自动关阀)
+unsigned long safeVentStartTime = 0;
+unsigned long safeVentDuration  = 0;
+const unsigned long DEFLATE_ALL_DEFAULT_MS = 5000;  // STOP_ALL 后放气 5 秒
+
 bool inflatingAll = false;
 bool deflatingAll = false;
 bool inflatingM   = false;
 bool testingPump  = false;
+bool safeVenting  = false;   // v4.4:STOP_ALL 安全放气进行中
+
+// 串口接收缓冲区(报告 6.3)
+char rxBuffer[RX_BUFFER_SIZE];
+uint8_t rxLength = 0;
 
 
 // ============ 辅助函数 ============
@@ -188,10 +222,11 @@ inline bool elapsedSince(unsigned long start, unsigned long duration) {
 }
 
 /**
- * parseStrictUInt - 严格无符号整数解析(报告 10.2)
+ * parseStrictUInt - 严格无符号整数解析(报告 10.3:增加溢出检查)
  *
  * 与 String.toInt() 不同:任一非数字字符返回 false,
  * 拒绝 "12abc" / "" / "-5" / "3.5" 等畸形输入。
+ * 极长数字不再无符号回绕成较小值(ULONG_MAX 检查)。
  *
  * @param text  输入字符串
  * @param value 输出解析结果(仅当返回 true 时有效)
@@ -203,7 +238,10 @@ bool parseStrictUInt(const String &text, unsigned long &value) {
   for (unsigned int i = 0; i < text.length(); i++) {
     char c = text.charAt(i);
     if (c < '0' || c > '9') return false;
-    result = result * 10UL + (unsigned long)(c - '0');
+    unsigned long digit = (unsigned long)(c - '0');
+    // 溢出检查:result * 10 + digit > ULONG_MAX 时拒绝
+    if (result > (ULONG_MAX - digit) / 10UL) return false;
+    result = result * 10UL + digit;
   }
   value = result;
   return true;
@@ -231,7 +269,10 @@ bool parseStrictFloatSeconds(const String &text, float &value) {
     if (c >= '0' && c <= '9') {
       seenDigit = true;
       if (!seenDot) {
-        intPart = intPart * 10UL + (unsigned long)(c - '0');
+        unsigned long digit = (unsigned long)(c - '0');
+        // 整数部分溢出检查
+        if (intPart > (ULONG_MAX - digit) / 10UL) return false;
+        intPart = intPart * 10UL + digit;
       } else {
         fracVal += (float)(c - '0') / divisor;
         divisor *= 10.0;
@@ -312,7 +353,7 @@ void emergencyPumpOff(int deviceIdx) {
  * deviceOff - 停止单台设备(通用接口,内部走正常停止)
  *
  * 用于模式切换/到时自动停止等正常场景。
- * STOP_ALL 路径应直接调用 emergencyPumpOff 而非本函数。
+ * 紧急路径应直接调用 emergencyPumpOff / emergencyStopAllPumps。
  */
 void deviceOff(int deviceIdx) {
   normalPumpOff(deviceIdx);
@@ -329,6 +370,7 @@ void deviceOff(int deviceIdx) {
  *   - false (通电=关闭):  open=true  -> deviceOff; open=false -> deviceOn
  *
  * 这层抽象解耦了"通电"和"阀开",修复旧版"充气时阀仍在放气"问题。
+ * v4.4:HOLD_ALL / STOP_ALL 都通过本函数控制阀,两种极性均正确。
  */
 void setValveOpen(int channel, bool open) {
   int device = valveToDevice(channel);
@@ -356,10 +398,97 @@ void setPumpRunning(int channel, bool running) {
 }
 
 /**
- * allOff - 全部 6 台设备停止 + 继电器断开(紧急停止语义)
- * 用于 STOP_ALL 指令、模式切换前清理、上电初始化
+ * stopPumpsImmediately - 立即停止全部泵(报告 7.3)
  *
- * 报告 7.3:统一走 emergencyPumpOff,确保硬件断电优先
+ * 两阶段硬断电,无 delay():
+ *   1. 先断开全部泵继电器(硬件断电优先)
+ *   2. 再清零全部泵 PWM 信号
+ * 不触碰阀,允许调用者随后选择 holdPressure(关阀)或 safeVent(开阀)。
+ */
+void stopPumpsImmediately() {
+  // 第一阶段:全部泵继电器断开
+  for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+    setRelay(pumpToDevice(ch), false);
+  }
+  // 第二阶段:清零全部泵 PWM
+  for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+    setPwm(pumpToDevice(ch), PWM_OFF_DUTY);
+  }
+}
+
+/**
+ * holdPressure - 停泵并关闭全部阀,保持当前气量(报告 7.3/7.4)
+ *
+ * 用于:
+ *   - 动作恢复后停泵保压
+ *   - 达到 GAS_MAX 后停泵保压
+ *
+ * 行为:
+ *   1. 立即停全部泵(硬断电)
+ *   2. 关闭全部排气阀(VALVE_ENERGIZED_MEANS_OPEN 自动映射极性)
+ *   3. 清除所有运行标志,进入 MODE_HOLD
+ *
+ * 报告 7.2:无论 VALVE_ENERGIZED_MEANS_OPEN 是 true 还是 false,
+ *          本函数都能正确关闭阀保压(因为通过 setValveOpen 自动映射)。
+ */
+void holdPressure() {
+  stopPumpsImmediately();
+  for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+    setValveOpen(ch, false);  // 关闭排气阀 = 保持气体
+  }
+  // 清除所有运行标志
+  inflatingAll = false;
+  deflatingAll = false;
+  inflatingM   = false;
+  testingPump  = false;
+  safeVenting  = false;
+  for (int i = 0; i < CHANNEL_COUNT; i++) {
+    inflateMPumpActive[i] = false;
+  }
+  currentMode = MODE_HOLD;
+}
+
+/**
+ * safeVent - 停泵并打开全部阀,安全放气(报告 7.3/7.4)
+ *
+ * 用于:
+ *   - STOP_ALL 指令(替代旧版 allOff 的歧义语义)
+ *   - SAFE_STOP
+ *   - 人离开触发的安全放气
+ *
+ * 行为:
+ *   1. 立即停全部泵(硬断电)
+ *   2. 打开全部排气阀(VALVE_ENERGIZED_MEANS_OPEN 自动映射极性)
+ *   3. 清除所有运行标志,进入 MODE_SAFE_VENT
+ *
+ * 报告 7.2:无论 VALVE_ENERGIZED_MEANS_OPEN 是 true 还是 false,
+ *          本函数都能正确打开阀放气。
+ */
+void safeVent() {
+  stopPumpsImmediately();
+  for (int ch = 0; ch < CHANNEL_COUNT; ch++) {
+    setValveOpen(ch, true);   // 打开排气阀 = 放气
+  }
+  // 清除所有运行标志
+  inflatingAll = false;
+  deflatingAll = false;
+  inflatingM   = false;
+  testingPump  = false;
+  for (int i = 0; i < CHANNEL_COUNT; i++) {
+    inflateMPumpActive[i] = false;
+  }
+  currentMode = MODE_SAFE_VENT;
+  safeVentStartTime = millis();
+  safeVentDuration  = DEFLATE_ALL_DEFAULT_MS;
+  safeVenting = true;
+}
+
+/**
+ * allOff - 兼容旧调用:全部 6 台设备停止 + 继电器断开
+ *
+ * v4.4 注:此函数不再用于 STOP_ALL(STOP_ALL 改走 safeVent)。
+ * 仅供 setup() 初始化、模式切换前清理使用。
+ * 报告 7.3:统一走 emergencyPumpOff,确保硬件断电优先。
  */
 void allOff() {
   for (int i = 0; i < 6; i++) {
@@ -370,6 +499,7 @@ void allOff() {
   deflatingAll = false;
   inflatingM   = false;
   testingPump  = false;
+  safeVenting  = false;
   for (int i = 0; i < CHANNEL_COUNT; i++) {
     inflateMPumpActive[i] = false;
   }
@@ -533,6 +663,8 @@ void sendStatus() {
     case MODE_DEFLATE_ALL: Serial.print("DEFLATE_ALL"); break;
     case MODE_INFLATE_M:   Serial.print("INFLATE_M"); break;
     case MODE_TEST:        Serial.print("TEST"); break;
+    case MODE_HOLD:        Serial.print("HOLD"); break;
+    case MODE_SAFE_VENT:   Serial.print("SAFE_VENT"); break;
   }
   Serial.print(",relay=");
   for (int i = 0; i < 6; i++) {
@@ -543,6 +675,116 @@ void sendStatus() {
     Serial.print(pwmDuty[i] == PWM_ON_DUTY ? "1" : "0");
   }
   Serial.println();
+}
+
+// ============ 串口非阻塞解析(报告 6.3)============
+
+/**
+ * pollSerial - 非阻塞串口接收并解析指令
+ *
+ * 报告 6.3:旧版 Serial.readStringUntil('\n') 在收到半条数据时会
+ * 阻塞约 1 秒(Serial 默认超时),延迟泵的到时停止检查。
+ * 新版使用固定缓冲区,逐字符读取,遇到 '\n' 才解析,无任何阻塞。
+ *
+ * 超长指令返回 ERR,LINE_TOO_LONG 并重置缓冲区,防止溢出。
+ */
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') continue;  // 忽略 CR
+
+    if (c == '\n') {
+      rxBuffer[rxLength] = '\0';
+      handleCommand(String(rxBuffer));
+      rxLength = 0;
+      continue;
+    }
+
+    if (rxLength < RX_BUFFER_SIZE - 1) {
+      rxBuffer[rxLength++] = c;
+    } else {
+      // 缓冲区溢出:丢弃当前指令,通知发送方
+      rxLength = 0;
+      sendERR("LINE_TOO_LONG");
+    }
+  }
+}
+
+/**
+ * handleCommand - 解析并执行一行完整指令
+ */
+void handleCommand(const String &line) {
+  String trimmed = line;
+  trimmed.trim();
+  if (trimmed.length() == 0) return;
+
+  if (trimmed == "STATUS") {
+    sendStatus();
+
+  } else if (trimmed == "STOP_ALL") {
+    // v4.4:STOP_ALL 改为"停泵 + 安全放气"明确语义(报告 7.4)
+    safeVent();
+    sendACK("STOP_ALL");
+
+  } else if (trimmed == "HOLD_ALL") {
+    // v4.4 新增:停泵保压(报告 7.4)
+    holdPressure();
+    sendACK("HOLD_ALL");
+
+  } else if (trimmed == "INFLATE_M") {
+    bool wasInInflateM = (currentMode == MODE_INFLATE_M);
+    startInflateM();
+    sendACK(wasInInflateM ? "INFLATE_M_REFRESH" : "INFLATE_M");
+
+  } else if (trimmed.startsWith("INFLATE_ALL,")) {
+    // INFLATE_ALL,a  (前缀 "INFLATE_ALL," 长 12)
+    float a;
+    if (!parseStrictFloatSeconds(trimmed.substring(12), a)) {
+      sendERR("BAD_DURATION");
+    } else if (!validateDuration(a)) {
+      sendERR("BAD_DURATION");
+    } else {
+      startInflateAll(a);
+      sendACK("INFLATE_ALL");
+    }
+
+  } else if (trimmed.startsWith("DEFLATE_ALL,")) {
+    // DEFLATE_ALL,b  (前缀 "DEFLATE_ALL," 长 12)
+    float b;
+    if (!parseStrictFloatSeconds(trimmed.substring(12), b)) {
+      sendERR("BAD_DURATION");
+    } else if (!validateDuration(b)) {
+      sendERR("BAD_DURATION");
+    } else {
+      startDeflateAll(b);
+      sendACK("DEFLATE_ALL");
+    }
+
+  } else if (trimmed.startsWith("TEST_PUMP,")) {
+    // TEST_PUMP,pumpIdx,seconds  (前缀 "TEST_PUMP," 长 10)
+    int firstComma = trimmed.indexOf(',', 10);
+    if (firstComma < 0) {
+      sendERR("BAD_ARGS");
+    } else {
+      unsigned long pumpIdxUL;
+      float seconds;
+      if (!parseStrictUInt(trimmed.substring(10, firstComma), pumpIdxUL)) {
+        sendERR("BAD_PUMP_INDEX");
+      } else if (!parseStrictFloatSeconds(trimmed.substring(firstComma + 1), seconds)) {
+        sendERR("BAD_TEST_DURATION");
+      } else {
+        int pumpIdx = (int)pumpIdxUL;
+        if (testPump(pumpIdx, seconds)) {
+          sendACK("TEST_PUMP");
+        }
+        // 失败时 testPump 内部已发 ERR
+      }
+    }
+
+  } else {
+    sendERR("UNKNOWN_CMD");
+  }
 }
 
 // ============ setup / loop ============
@@ -567,6 +809,7 @@ void setup() {
     analogWrite(PWM_PINS[i], PWM_OFF_DUTY);
     pwmDuty[i] = PWM_OFF_DUTY;
   }
+  rxLength = 0;
   allOff();  // 清除所有运行时标志(双重保险)
   // 上电就绪:回送本板 ID + 3 泵点充时长(用于 Python 端核对烧录参数)
   // 格式: READY,<板号>,<泵1时长>,<泵2时长>,<泵3时长>  (单位 ms)
@@ -582,80 +825,12 @@ void setup() {
 /**
  * loop - 主循环
  *
- * 1. 接收并解析串口指令(模式互斥:进入新指令前先 allOff)
- * 2. 检查各模式是否到期(用 millis() 差值防回绕),到期自动断开
+ * 1. 先检查各模式是否到期(报告 6.3:先于串口处理,确保准时停泵)
+ * 2. 接收并解析串口指令(非阻塞 pollSerial)
+ * 3. 再次检查到期(防止 pollSerial 解析复杂指令占用时间错过到时停止)
  */
 void loop() {
-  // ---- 1. 接收串口指令 ----
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-
-    if (line.length() == 0) {
-      // 空行忽略
-    } else if (line == "STATUS") {
-      sendStatus();
-
-    } else if (line == "STOP_ALL") {
-      allOff();   // 紧急停止语义
-      sendACK("STOP_ALL");
-
-    } else if (line == "INFLATE_M") {
-      bool wasInInflateM = (currentMode == MODE_INFLATE_M);
-      startInflateM();
-      sendACK(wasInInflateM ? "INFLATE_M_REFRESH" : "INFLATE_M");
-
-    } else if (line.startsWith("INFLATE_ALL,")) {
-      // INFLATE_ALL,a  (前缀 "INFLATE_ALL," 长 12)
-      float a;
-      if (!parseStrictFloatSeconds(line.substring(12), a)) {
-        sendERR("BAD_DURATION");
-      } else if (!validateDuration(a)) {
-        sendERR("BAD_DURATION");
-      } else {
-        startInflateAll(a);
-        sendACK("INFLATE_ALL");
-      }
-
-    } else if (line.startsWith("DEFLATE_ALL,")) {
-      // DEFLATE_ALL,b  (前缀 "DEFLATE_ALL," 长 12)
-      float b;
-      if (!parseStrictFloatSeconds(line.substring(12), b)) {
-        sendERR("BAD_DURATION");
-      } else if (!validateDuration(b)) {
-        sendERR("BAD_DURATION");
-      } else {
-        startDeflateAll(b);
-        sendACK("DEFLATE_ALL");
-      }
-
-    } else if (line.startsWith("TEST_PUMP,")) {
-      // TEST_PUMP,pumpIdx,seconds  (前缀 "TEST_PUMP," 长 10)
-      int firstComma = line.indexOf(',', 10);
-      if (firstComma < 0) {
-        sendERR("BAD_ARGS");
-      } else {
-        unsigned long pumpIdxUL;
-        float seconds;
-        if (!parseStrictUInt(line.substring(10, firstComma), pumpIdxUL)) {
-          sendERR("BAD_PUMP_INDEX");
-        } else if (!parseStrictFloatSeconds(line.substring(firstComma + 1), seconds)) {
-          sendERR("BAD_TEST_DURATION");
-        } else {
-          int pumpIdx = (int)pumpIdxUL;
-          if (testPump(pumpIdx, seconds)) {
-            sendACK("TEST_PUMP");
-          }
-          // 失败时 testPump 内部已发 ERR
-        }
-      }
-
-    } else {
-      sendERR("UNKNOWN_CMD");
-    }
-  }
-
-  // ---- 2. 到时自动断开(用 millis() 差值防回绕)----
+  // ---- 1. 到时自动断开(用 millis() 差值防回绕)----
 
   // 全充气到期
   if (inflatingAll && elapsedSince(inflateAllStartTime, inflateAllDuration)) {
@@ -703,6 +878,42 @@ void loop() {
       setPumpRunning(i, false);
     }
     testingPump = false;
+    currentMode = MODE_IDLE;
+  }
+
+  // v4.4:STOP_ALL 安全放气到期,关闭所有阀(回到 IDLE)
+  if (safeVenting && elapsedSince(safeVentStartTime, safeVentDuration)) {
+    for (int i = 0; i < CHANNEL_COUNT; i++) {
+      setValveOpen(i, false);
+    }
+    safeVenting = false;
+    currentMode = MODE_IDLE;
+  }
+
+  // ---- 2. 串口指令处理(报告 6.3:非阻塞 pollSerial)----
+  pollSerial();
+
+  // ---- 3. 二次检查到期(报告 6.3 推荐:防止 pollSerial 内部
+  //         解析复杂指令占用时间错过到时停止)----
+  if (inflatingAll && elapsedSince(inflateAllStartTime, inflateAllDuration)) {
+    for (int i = 0; i < CHANNEL_COUNT; i++) {
+      setPumpRunning(i, false);
+    }
+    inflatingAll = false;
+    currentMode = MODE_IDLE;
+  }
+  if (testingPump && elapsedSince(testStartTime, testDuration)) {
+    for (int i = 0; i < CHANNEL_COUNT; i++) {
+      setPumpRunning(i, false);
+    }
+    testingPump = false;
+    currentMode = MODE_IDLE;
+  }
+  if (safeVenting && elapsedSince(safeVentStartTime, safeVentDuration)) {
+    for (int i = 0; i < CHANNEL_COUNT; i++) {
+      setValveOpen(i, false);
+    }
+    safeVenting = false;
     currentMode = MODE_IDLE;
   }
 }

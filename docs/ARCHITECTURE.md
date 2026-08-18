@@ -6,7 +6,13 @@
 
 项目采用 **分层 + 模块化** 架构,所有可调参数集中在 `config.py`,业务逻辑拆分到独立模块,`main.py` 仅负责组装与主循环。
 
-**v4.3 架构**:3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用**占空比 PWM + 继电器供电隔离**模型(报告 c15a9b0:弃用 `<Servo.h>` RC 脉冲,改用 `analogWrite()` 硬件 PWM;新增 `VALVE_ENERGIZED_MEANS_OPEN` 阀极性配置解耦"通电"与"阀开"语义)。
+**v4.4 架构**(报告 107d463 复查):3 块泵控 UNO(PUMP_A/B/C,各控 3 泵 + 3 阀 = 6 设备)+ 1 块灯箱 UNO(LIGHT),共 9 泵 9 阀 3 灯。泵控采用**占空比 PWM + 继电器供电隔离**模型(v4.3 报告 c15a9b0:弃用 `<Servo.h>` RC 脉冲,改用 `analogWrite()` 硬件 PWM;新增 `VALVE_ENERGIZED_MEANS_OPEN` 阀极性配置解耦"通电"与"阀开"语义)。v4.4 关键变更:
+
+- **阀停止语义拆分**:新增 `stopPumpsImmediately()` / `holdPressure()` / `safeVent()` 三个独立函数,替代旧版 `allOff()` 的歧义语义。`HOLD_ALL` 命令对应 `holdPressure()`(停泵保压),`STOP_ALL` 改走 `safeVent()`(停泵放气),通过 `setValveOpen` 自动映射阀极性,两种 `VALVE_ENERGIZED_MEANS_OPEN` 配置都正确。
+- **非阻塞串口解析**:三份 Arduino 固件统一改为 `pollSerial()` + `rxBuffer[]` 固定缓冲区逐字符读取,弃用阻塞式 `Serial.readStringUntil('\n')`,半条指令不再延迟泵到时停止检查。
+- **严格整数溢出保护**:`parseStrictUInt` 增加 `ULONG_MAX` 溢出检查,极长数字不再无符号回绕成较小值。
+- **Python 灯箱异常容错**:`_read_ack()` 捕获 `readline()` 抛出的 `OSError`/`SerialException`,调 `_mark_disconnected_no_lock()` 标记断开,USB 拔出不再让主循环退出。
+- **单板测试固件 P1 修复**:`STOP_PUMPS` 改为 `emergencyStopAllPumps()` 两阶段立即硬断电(无 `delay()`),增加泵阀互锁(`VALVE_OPEN` 检查对应泵运行状态),定时统一用 `start + duration + elapsedSince()` 防 `millis()` 回绕,`TEST_SIGNAL` 参数命名 `off_us/on_us` 修正为 `off_duty/on_duty`。
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -96,20 +102,31 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 ### modules/serial_sender.py — 串口发送模块
 包含 3 个类:
 
+**`SerialSender`(基类)**:串口封装,线程安全
+- `connect(expected_board_id, ready_timeout, expected_ready_params)`:打开串口并读取 READY,校验板号与点充时长参数
+- `send_and_wait(message, expected_board_id, accepted_commands, response_timeout)`:发送命令并等待 ACK/ERR
+- `_read_ack()`:v4.4 捕获 `readline()` 抛出的 `OSError`/`SerialException`,调 `_mark_disconnected_no_lock()` 标记断开,避免异常冒泡到主循环导致退出
+- `_mark_disconnected_no_lock()`:v4.4 新增,不加锁的内部断开函数(报告 9.3:避免在已持锁上下文中调用 `close()` 造成死锁)
+- `close()` / `is_connected`
+
 **`PumpSender`(继承 SerialSender)**:单块泵控 UNO 串口
 - `connect(expected_board_id, ready_timeout, expected_ready_params)`:打开串口并读取 READY,校验板号与三路点充时长(报告 10.2:`expected_ready_params` 非 None 时,READY 必须携带 5 字段且三路时长与 Python 配置完全相等,否则拒绝连接)
 - `send_and_wait(message, expected_board_id, accepted_commands, response_timeout)`:发送命令并等待 ACK/ERR
 - `send_inflate_all(seconds)` / `send_deflate_all(seconds)` / `send_inflate_m()` / `send_stop_all()`
+- `send_hold_all()`:v4.4 新增,发送 `HOLD_ALL` 命令(对应固件 `holdPressure()`,停泵保压)
 
 **`LightSender`(继承 SerialSender)**:灯箱 UNO 串口
 - `send_light_on(id)` / `send_light_off(id)` / `send_all_off()` / `send_flash(times)`
+- v4.4:以上四个方法均通过 `send_and_wait()` → `_read_ack()` 路径,自动享受 USB 断开异常容错(报告 9.3)
 - `light_id_for_action(action_name)`:动作 → 灯号映射
 
 **`PumpGroupSender`**:泵组发送器,管理 3 块泵控 UNO
 - `connect_all(expected_inflate_m_ms)`:连接 3 板并校验板号 + 三路点充时长(任一失败返回 False;`expected_inflate_m_ms` 来自 `config.INFLATE_M_MS_PER_BOARD`,逐板传入对应三路时长做 READY 严格比对)
 - `send_inflate_all(seconds)` / `send_deflate_all(seconds)` / `send_inflate_m()`:三板广播,任一板失败 → `stop_all_best_effort()` + 返回 False(状态机进 SAFE_STOP)
+- `send_hold_all()`:v4.4 新增,三板广播 `HOLD_ALL`,任一板失败 → `stop_all_best_effort()` + 返回 False
 - `send_stop_all()`:best-effort 广播 STOP_ALL(不进 SAFE_STOP,避免递归)
 - `send_deflate_all_best_effort(seconds)`:仅供 SAFE_STOP 使用,部分失败不再 STOP_ALL(避免取消正常板放气)
+- `_send_all_and_collect(command, accepted_commands, response_timeout)`:v4.3 公平轮询收集 ACK,逐板 try/except 捕获 USB 拔出等异常(报告 10.1)
 - `test_mode=True`(SERIAL_ENABLED=False):跳过所有串口发送并返回成功,状态机可正常流转
 
 ### modules/visualizer.py — `Visualizer` + `FPSCounter` 类
@@ -161,9 +178,15 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 | `INFLATE_ALL,a` | 全部 3 泵充气 a 秒 | 0 < a ≤ 30,否则 `ERR,<板号>,BAD_DURATION` |
 | `DEFLATE_ALL,b` | 全部 3 阀打开放气 b 秒 | 0 < b ≤ 30,否则 `ERR,<板号>,BAD_DURATION` |
 | `INFLATE_M` | 9 泵同步点充,每泵独立时长 | — |
-| `STOP_ALL` | 立即停止全部 6 设备(模式互斥优先级最高) | — |
+| `HOLD_ALL` | v4.4 新增:停泵并关闭全部阀,保持当前气量(对应 `holdPressure()`) | — |
+| `STOP_ALL` | v4.4 变更:停泵并打开全部阀安全放气(对应 `safeVent()`,放气持续 5 秒后自动关阀) | — |
 | `STATUS` | 查询当前板状态 | 返回 `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` |
 | `TEST_PUMP,i,t` | 测试第 i 号泵(0..2),持续 t 秒 | 0 < t ≤ 5 |
+
+> **v4.4 阀停止语义拆分**(报告 107d463 第 7 节):
+> - 旧版 `STOP_ALL` 走 `allOff()` 全断电,在 `VALVE_ENERGIZED_MEANS_OPEN=false` 时会让阀断电=打开,意外放掉气球。
+> - v4.4 拆分为 `stopPumpsImmediately()`(只停泵)、`holdPressure()`(停泵+关阀保压)、`safeVent()`(停泵+开阀放气)三个独立函数,均通过 `setValveOpen()` 自动映射极性,两种阀配置都正确。
+> - `HOLD_ALL` 用于动作恢复后/达到 `GAS_MAX` 后停泵保压;`STOP_ALL` 改为安全放气语义。
 
 ### 响应格式
 
@@ -172,7 +195,7 @@ INIT(充气a秒) → WAITING(等人≥n1秒) → EXTRACTING(抽动作,亮灯)
 | `READY,<板号>,<点充时长1>,<点充时长2>,<点充时长3>` | 上电就绪(含本板 INFLATE_M_MS_PER_PUMP 数值,用于核对烧录参数) |
 | `ACK,<板号>,<命令>` | 指令执行成功 |
 | `ERR,<板号>,<原因>` | 指令拒绝/失败 |
-| `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` | 状态查询响应(mode ∈ IDLE/INFLATE_ALL/DEFLATE_ALL/INFLATE_M/TEST;relay/pwm 为 6 位 0/1 位图,设备 0..5) |
+| `STATUS,<板号>,mode=...,relay=xxxxxx,pwm=xxxxxx` | 状态查询响应(mode ∈ IDLE/INFLATE_ALL/DEFLATE_ALL/INFLATE_M/TEST/HOLD/SAFE_VENT;relay/pwm 为 6 位 0/1 位图,设备 0..5) |
 
 ### 灯箱(LIGHT, COM4)
 

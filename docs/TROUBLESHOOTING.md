@@ -256,6 +256,65 @@ pip install protobuf==3.20.3 --force-reinstall
        self._running = False
    ```
 
+### Q20:v4.4 灯箱 USB 拔出后 Python 主程序退出(报告 9.x)
+
+**原因**:v4.3 灯箱 `_read_ack()` 未捕获 `readline()` 抛出的 `OSError`/`SerialException`,异常冒泡到主循环导致退出。
+
+**解决**:
+1. 升级到 v4.4 `modules/serial_sender.py`,`_read_ack()` 已捕获异常并调 `_mark_disconnected_no_lock()` 标记断开,返回 False 而不抛异常。
+2. 状态机/主循环对灯箱失败应只记录日志,不影响泵控安全流程。
+3. 灯箱恢复连接需重启程序(目前无热重连)。
+4. 单元测试覆盖:`tests/test_serial_sender.py::TestLightReadAckException`(7 个用例,验证返回 False、标记断开、清理 serial_conn、后续调用不抛异常)。
+
+### Q21:v4.4 STOP_ALL 行为变更(报告 7.x)
+
+**原因**:v4.3 的 `STOP_ALL` 走 `allOff()` 全断电,在 `VALVE_ENERGIZED_MEANS_OPEN=false` 配置下会让阀断电=打开,意外放掉气球。
+
+**解决**:
+1. v4.4 固件 `STOP_ALL` 改为 `safeVent()` 语义:停泵 + 打开全部阀放气(5 秒后自动关阀)。
+2. 若需"停泵保压"(动作恢复 / GAS_MAX),改发新命令 `HOLD_ALL`(对应 `holdPressure()`)。
+3. 两种命令均通过 `setValveOpen()` 自动映射极性,两种 `VALVE_ENERGIZED_MEANS_OPEN` 配置都正确。
+4. Python 侧:`PumpSender.send_hold_all()` / `PumpGroupSender.send_hold_all()` 已就位。
+
+### Q22:v4.4 单板测试固件 STOP_PUMPS 不立即停泵(报告 5.x)
+
+**原因**:v1.0 单板测试固件的 `STOP_PUMPS` 走 `setPumpRunning(false)` → `normalPumpOff()`(含 `delay(50)`),三泵顺序停止,最多相差约 100ms。
+
+**解决**:
+1. 升级到 v1.1 单板测试固件,`STOP_PUMPS` 改为 `emergencyStopAllPumps()` 两阶段立即硬断电(无 `delay()`):
+   - 阶段 1:全部泵继电器断开
+   - 阶段 2:清零全部泵 PWM
+2. 同时清理 `inflateChannelActive`,防止 STOP 后到时仍输出 `DONE,INFLATE_CHANNEL` 误导测试人员。
+3. 验收命令序列(报告 5.3):
+   ```
+   ARM
+   INFLATE_CHANNEL,0,1000
+   STOP_PUMPS
+   STATUS
+   ```
+   期望:STOP 后泵立即停止,STATUS 中 pump=000,且原 1000ms 到期不再输出 DONE。
+
+### Q23:v4.4 单板测试固件允许"泵运行 + 阀同时放气"(报告 8.x)
+
+**原因**:v1.0 单板测试固件 `VALVE_OPEN` 不检查对应泵是否运行,允许 `INFLATE_CHANNEL,0,2000` 后立即 `VALVE_OPEN,0`,形成泵充气 + 阀放气冲突。
+
+**解决**:
+1. 升级到 v1.1 单板测试固件,`cmdValveOpen()` 增加 `isPumpRunning(channel)` 检查:
+   ```cpp
+   if (isPumpRunning(channel)) { sendERR("PUMP_RUNNING"); return; }
+   ```
+2. 测试时若需开阀,先 `STOP_PUMPS` 或 `DISARM`,再 `VALVE_OPEN`。
+
+### Q24:v4.4 半条串口指令延迟泵停止(报告 6.x)
+
+**原因**:v4.3 三份 Arduino 固件使用阻塞式 `Serial.readStringUntil('\n')`,默认超时约 1 秒,半条指令(无 `\n`)会阻塞主循环,延迟泵到时停止检查。
+
+**解决**:
+1. v4.4 三份固件改为非阻塞 `pollSerial()` + `rxBuffer[]` 固定缓冲区逐字符读取。
+2. `loop()` 中先检查到期、再 `pollSerial()`、再二次检查到期,确保准时停泵。
+3. 超长指令(超过 `RX_BUFFER_SIZE`)返回 `ERR,LINE_TOO_LONG` 并重置缓冲区。
+4. 验收:启动 300ms 泵测试,运行中发送无 `\n` 的半条指令,测量泵实际停止时间应在允许误差内,而非延长到 1 秒以上。
+
 ## 调试技巧
 
 ### 开启 DEBUG 日志

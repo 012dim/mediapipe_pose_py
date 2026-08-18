@@ -1,9 +1,16 @@
 /*
- * 灯箱控制 Uno (LIGHT 板) v4.2.1
+ * 灯箱控制 Uno (LIGHT 板) v4.2.2
  * 接收串口指令控制 3 路继电器(3 个灯泡),非阻塞闪烁
  *
  * 报告 7.1:本文件从 lightbox_uno_commands.txt 拆出,
  * 可直接用 Arduino IDE 打开上传,无需复制粘贴。
+ *
+ * v4.2.2 关键变更(报告 107d463 复查):
+ *   1. 串口改为非阻塞缓冲区解析(pollSerial + rxBuffer),不再使用
+ *      阻塞式 Serial.readStringUntil('\n')(报告 6.3)。
+ *   2. 用 parseStrictUInt 替换宽松 toInt,拒绝 "LIGHT_ON,1abc" 等畸形
+ *      指令(报告 10.1)。
+ *   3. parseStrictUInt 增加 ULONG_MAX 溢出检查(报告 10.3)。
  *
  * 串口协议(9600 baud,每行一条指令,以 '\n' 结尾):
  *   LIGHT_ON,id     点亮指定灯(id=1/2/3)
@@ -45,9 +52,38 @@ const bool RELAY_ACTIVE_LOW = true;
 const unsigned long FLASH_ON_MS = 300;   // 闪烁时灯亮时长(毫秒)
 const unsigned long FLASH_OFF_MS = 300;  // 闪烁时灯灭时长(毫秒)
 
+// ---- 串口接收缓冲区(报告 6.3:非阻塞解析)----
+const uint8_t RX_BUFFER_SIZE = 32;
+
 /* =====================================================================
  * 用户可调参数区结束
  * ===================================================================== */
+
+/**
+ * parseStrictUInt - 严格无符号整数解析(报告 10.1/10.3)
+ *
+ * 与 String.toInt() 不同:任一非数字字符返回 false,
+ * 拒绝 "12abc" / "" / "-5" / "3.5" 等畸形输入。
+ * 极长数字不再无符号回绕成较小值(ULONG_MAX 检查)。
+ *
+ * @param text  输入字符串
+ * @param value 输出解析结果(仅当返回 true 时有效)
+ * @return true 解析成功;false 输入非法
+ */
+bool parseStrictUInt(const String &text, unsigned long &value) {
+  if (text.length() == 0) return false;
+  unsigned long result = 0;
+  for (unsigned int i = 0; i < text.length(); i++) {
+    char c = text.charAt(i);
+    if (c < '0' || c > '9') return false;
+    unsigned long digit = (unsigned long)(c - '0');
+    // 溢出检查:result * 10 + digit > ULONG_MAX 时拒绝
+    if (result > (ULONG_MAX - digit) / 10UL) return false;
+    result = result * 10UL + digit;
+  }
+  value = result;
+  return true;
+}
 
 /**
  * setLight - 控制单个灯泡亮/灭
@@ -131,56 +167,108 @@ void sendERR(const String &reason) {
   Serial.println(reason);
 }
 
+// ============ 串口非阻塞解析(报告 6.3)============
+
+// 串口接收缓冲区
+char rxBuffer[RX_BUFFER_SIZE];
+uint8_t rxLength = 0;
+
+/**
+ * pollSerial - 非阻塞串口接收并解析指令
+ *
+ * 报告 6.3:旧版 Serial.readStringUntil('\n') 在收到半条数据时会
+ * 阻塞约 1 秒,新版使用固定缓冲区,逐字符读取,遇到 '\n' 才解析。
+ */
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') continue;  // 忽略 CR
+
+    if (c == '\n') {
+      rxBuffer[rxLength] = '\0';
+      handleCommand(String(rxBuffer));
+      rxLength = 0;
+      continue;
+    }
+
+    if (rxLength < RX_BUFFER_SIZE - 1) {
+      rxBuffer[rxLength++] = c;
+    } else {
+      // 缓冲区溢出:丢弃当前指令,通知发送方
+      rxLength = 0;
+      sendERR("LINE_TOO_LONG");
+    }
+  }
+}
+
+/**
+ * handleCommand - 解析并执行一行完整指令
+ */
+void handleCommand(const String &line) {
+  String trimmed = line;
+  trimmed.trim();
+  if (trimmed.length() == 0) return;
+
+  if (trimmed.startsWith("LIGHT_ON,")) {
+    // LIGHT_ON,id  (前缀 "LIGHT_ON," 长 9)
+    unsigned long idUL;
+    if (!parseStrictUInt(trimmed.substring(9), idUL)) {
+      sendERR("BAD_LIGHT_ID");
+    } else if (idUL < 1 || idUL > 3) {
+      sendERR("BAD_LIGHT_ID");
+    } else {
+      cancelFlash();
+      setLight((int)idUL - 1, true);
+      sendACK("LIGHT_ON");
+    }
+
+  } else if (trimmed.startsWith("LIGHT_OFF,")) {
+    // LIGHT_OFF,id  (前缀 "LIGHT_OFF," 长 10)
+    unsigned long idUL;
+    if (!parseStrictUInt(trimmed.substring(10), idUL)) {
+      sendERR("BAD_LIGHT_ID");
+    } else if (idUL < 1 || idUL > 3) {
+      sendERR("BAD_LIGHT_ID");
+    } else {
+      cancelFlash();
+      setLight((int)idUL - 1, false);
+      sendACK("LIGHT_OFF");
+    }
+
+  } else if (trimmed == "LIGHT_ALL_OFF") {
+    cancelFlash();
+    sendACK("LIGHT_ALL_OFF");
+
+  } else if (trimmed.startsWith("LIGHT_FLASH,")) {
+    // LIGHT_FLASH,n  (前缀 "LIGHT_FLASH," 长 12)
+    unsigned long timesUL;
+    if (!parseStrictUInt(trimmed.substring(12), timesUL)) {
+      sendERR("BAD_FLASH_COUNT");
+    } else if (timesUL < 1 || timesUL > 20) {
+      sendERR("BAD_FLASH_COUNT");
+    } else {
+      startFlash((int)timesUL);
+      sendACK("LIGHT_FLASH");   // 先回 ACK(0.8s 内可达)
+    }
+
+  } else {
+    sendERR("UNKNOWN_CMD");
+  }
+}
+
 void setup() {
   Serial.begin(9600);
   for (int i = 0; i < 3; i++) {
     pinMode(LIGHT_PINS[i], OUTPUT);
   }
   allOff();
+  rxLength = 0;
   Serial.print("READY,");
   Serial.println(BOARD_ID);
 }
 
 void loop() {
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-
-    if (line.length() == 0) {
-      // 空行忽略
-    } else if (line.startsWith("LIGHT_ON,")) {
-      int id = line.substring(9).toInt();
-      if (id >= 1 && id <= 3) {
-        cancelFlash();
-        setLight(id - 1, true);
-        sendACK("LIGHT_ON");
-      } else {
-        sendERR("BAD_LIGHT_ID");
-      }
-    } else if (line.startsWith("LIGHT_OFF,")) {
-      int id = line.substring(10).toInt();
-      if (id >= 1 && id <= 3) {
-        cancelFlash();
-        setLight(id - 1, false);
-        sendACK("LIGHT_OFF");
-      } else {
-        sendERR("BAD_LIGHT_ID");
-      }
-    } else if (line == "LIGHT_ALL_OFF") {
-      cancelFlash();
-      sendACK("LIGHT_ALL_OFF");
-    } else if (line.startsWith("LIGHT_FLASH,")) {
-      int times = line.substring(12).toInt();
-      if (times <= 0 || times > 20) {
-        sendERR("BAD_FLASH_COUNT");
-      } else {
-        startFlash(times);
-        sendACK("LIGHT_FLASH");   // 先回 ACK(0.8s 内可达)
-      }
-    } else {
-      sendERR("UNKNOWN_CMD");
-    }
-  }
-
+  pollSerial();
   updateFlash();
 }

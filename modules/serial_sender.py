@@ -6,6 +6,14 @@ v4.2 新增:
 - PumpGroupSender 三板先写后收集(不串行等待)
 - send_deflate_all_best_effort() 仅供 SAFE_STOP,部分失败不再 STOP_ALL
 
+v4.4 新增(报告 107d463 复查):
+- _read_ack() 捕获 OSError/SerialException,调 _mark_disconnected_no_lock
+  防止灯箱 USB 断开导致主循环退出(报告 9.3)
+- _mark_disconnected_no_lock():不加锁的内部断开函数,
+  避免在已持锁上下文中调用 close() 造成死锁
+- send_hold_all():新增 HOLD_ALL 命令对应固件 holdPressure()
+- 三板广播支持 HOLD_ALL(v4.4 固件停泵保压语义)
+
 当 SERIAL_ENABLED = False(test_mode)时,所有方法跳过实际发送并返回成功,
 状态机可正常流转。
 """
@@ -177,6 +185,27 @@ class SerialSender:
             self._connected = False
             return False
 
+    def _mark_disconnected_no_lock(self) -> None:
+        """标记断开并关闭串口(不加锁,报告 9.3)。
+
+        报告 9.3:_read_ack() 在 send_and_wait() 持锁上下文中被调用,
+        若直接调用 close() 会再次获取同一把非重入锁造成死锁。
+        本函数提供"不加锁"的内部断开路径,供 _read_ack() 异常路径使用。
+
+        行为:
+        1. 标记 _connected = False
+        2. 关闭底层 serial_conn(捕获关闭异常,不抛出)
+        3. 置 serial_conn = None,防止后续误用
+        """
+        conn = self.serial_conn
+        self._connected = False
+        self.serial_conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("关闭故障串口失败: %s", self.port)
+
     def _read_ack(
         self,
         expected_board_id: str,
@@ -191,19 +220,34 @@ class SerialSender:
             READY,<板号>      → 忽略(仅连接阶段)
             STATUS,<板号>,... → 忽略(状态查询结果,不作 ACK)
 
+        v4.4(报告 9.3):捕获 readline() 抛出的 OSError/SerialException,
+        调用 _mark_disconnected_no_lock() 标记断开,避免异常冒泡到主循环
+        导致程序退出。该方法不加锁,可在已持锁上下文(send_and_wait)中调用。
+
         Args:
             expected_board_id: 期望的板号。
             accepted_commands: 接受的命令集合(如 {"INFLATE_ALL", "INFLATE_M_REFRESH"})。
             timeout: 读取超时秒数。
 
         Returns:
-            bool: 收到正确板号的 ACK 返回 True,ERR/板号错/超时返回 False。
+            bool: 收到正确板号的 ACK 返回 True,ERR/板号错/超时/异常返回 False。
         """
         if not self._connected or self.serial_conn is None:
             return False
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            line = self.serial_conn.readline()
+            # 报告 9.3:USB 拔出时 readline() 抛 OSError/SerialException,
+            # 旧版未捕获导致主循环退出。新版捕获后标记断开并返回 False。
+            try:
+                line = self.serial_conn.readline()
+            except Exception as exc:  # noqa: BLE001
+                # 涵盖 serial.SerialException(继承 OSError)及普通 OSError
+                logger.error(
+                    "串口 %s 读取 ACK 异常,标记断开: %s",
+                    self.port, exc,
+                )
+                self._mark_disconnected_no_lock()
+                return False
             if not line:
                 continue
             text = line.decode("utf-8", errors="replace").strip()
@@ -362,7 +406,8 @@ class PumpSender(SerialSender):
         INFLATE_ALL,a       全部 3 泵充气 a 秒
         DEFLATE_ALL,b       全部 3 阀打开放气 b 秒
         INFLATE_M           9 泵同步点充(每泵独立时长)
-        STOP_ALL            立即停止全部 6 设备
+        HOLD_ALL            停泵并关闭全部阀,保持当前气量(v4.4)
+        STOP_ALL            立即停泵并打开全部阀安全放气(v4.4)
         STATUS              查询当前板状态
         TEST_PUMP,i,t      测试第 i 号泵,持续 t 秒
     """
@@ -394,8 +439,27 @@ class PumpSender(SerialSender):
             accepted_commands={"INFLATE_M", "INFLATE_M_REFRESH"},
         )
 
+    def send_hold_all(self) -> bool:
+        """v4.4 新增:停泵并关闭全部阀,保持当前气量(等待 ACK)。
+
+        报告 7.4:对应固件 holdPressure(),用于动作恢复后停泵保压、
+        达到 GAS_MAX 后停泵保压。通过 setValveOpen 自动映射阀极性,
+        无论 VALVE_ENERGIZED_MEANS_OPEN 是 true 还是 false 都能正确关阀。
+        """
+        return self.send_and_wait(
+            "HOLD_ALL",
+            expected_board_id=self.board_id,
+            accepted_commands={"HOLD_ALL"},
+        )
+
     def send_stop_all(self) -> bool:
-        """立即停止全部 6 设备(等待 ACK)。
+        """立即停泵并打开全部阀安全放气(v4.4,等待 ACK)。
+
+        v4.4 变更(报告 7.4):STOP_ALL 在固件端改为 safeVent(),
+        明确"停泵 + 放气"语义。旧版 allOff() 的"全断电"语义在
+        VALVE_ENERGIZED_MEANS_OPEN=false 时会让阀打开放气,与项目
+        保压需求冲突;新版通过 setValveOpen 自动映射极性,两种配置
+        都能正确放气。
 
         报告 7.3:STOP_ALL 也必须读取 ACK,否则 ACK,STOP_ALL 会残留在
         串口缓冲区,污染下一条等待 ACK 的命令(如 DEFLATE_ALL)。
@@ -717,6 +781,29 @@ class PumpGroupSender:
         """广播 STOP_ALL 并读取 ACK;部分失败也不递归重发(报告 7.3)。"""
         results = self.stop_all_best_effort()
         return self._check_all_ok(results)
+
+    def send_hold_all(self) -> bool:
+        """v4.4 新增:广播 HOLD_ALL,停泵并关闭全部阀保压(报告 7.4)。
+
+        用于:
+          - 动作恢复后停泵保压(替代旧版"STOP_ALL + 等待")
+          - 达到 GAS_MAX 后停泵保压
+
+        任一板失败 → 触发 stop_all_best_effort() 并返回 False,
+        状态机进入 SAFE_STOP。
+
+        Returns:
+            bool: 三板全部 ACK 返回 True;任一板失败返回 False。
+        """
+        results = self._send_all_and_collect(
+            "HOLD_ALL",
+            accepted_commands={"HOLD_ALL"},
+        )
+        if not self._check_all_ok(results):
+            logger.error("[PUMP_GROUP] HOLD_ALL 部分失败,触发 STOP_ALL: %s", results)
+            self.stop_all_best_effort()
+            return False
+        return True
 
     def send_deflate_all_best_effort(self, seconds: float) -> dict:
         """仅供 SAFE_STOP 使用的放气方法。
